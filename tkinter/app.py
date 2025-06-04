@@ -672,7 +672,7 @@ if __name__ == "__main__":
     # VIDEO_SOURCE = "rtsp://your_rtsp_stream_url_here"  # RTSP stream
     # VIDEO_SOURCE = 0  # Webcam
     
-    VIDEO_SOURCE = "video2.mp4"  # Default to MP4 file for testing
+    VIDEO_SOURCE = "rtsp://admin:Admin4321@172.30.40.125/554/live/stream1"  # Default to MP4 file for testing
     
     app = BehaviorDetectionSystem(VIDEO_SOURCE)
     app.run()
