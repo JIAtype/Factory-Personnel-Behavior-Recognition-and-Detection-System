@@ -19,24 +19,25 @@ except ImportError:
 
 # --- PersonTracker Class ---
 class PersonTracker:
-    KEYPOINTS_HISTORY_MAXLEN = 30
-    MOVEMENT_THRESHOLD_PIXELS = 10  # Pixels for significant movement
-    STATIONARY_DURATION_SECONDS = 180  # 3 minutes to be considered stationary
-    FALL_ASPECT_RATIO_THRESHOLD = 1.8
+    KEYPOINTS_HISTORY_MAXLEN = 30 # 只保留最近30帧的关键点历史，防止内存无限增长
+    MOVEMENT_THRESHOLD_PIXELS = 10  # 关键点平均移动超过10个像素，才算“显著移动”
+    STATIONARY_DURATION_SECONDS = 180  # 3分钟（180秒）没有显著移动，就算“静止”
+    FALL_ASPECT_RATIO_THRESHOLD = 1.8  # 摔倒判断：人的边界框 宽度/高度 > 1.8 就算摔倒 
     FALL_HIP_SHOULDER_TOLERANCE_PX = 10
     FALL_HIP_ABOVE_SHOULDER_FACTOR = 0.2 # Hips need to be this factor of body_height above shoulders
 
     def __init__(self, person_id, keypoints):
-        self.id = person_id
-        self.keypoints_history = deque(maxlen=self.KEYPOINTS_HISTORY_MAXLEN)
-        self.last_movement_time = time.time()
-        self.is_fallen = False
-        self.is_stationary = False
-        self.fall_alert_sent = False
-        self.stationary_alert_sent = False
-        self.no_helmet_alert_sent = False
+        # 当第一次发现一个人时，会创建这个对象
+        self.id = person_id  # 给这个人一个唯一的ID
+        self.keypoints_history = deque(maxlen=self.KEYPOINTS_HISTORY_MAXLEN)  # deque列表，当满了之后，再加新的会自动挤掉最旧的
+        self.last_movement_time = time.time()  # 记录他最后一次移动的时间
+        self.is_fallen = False  # 他现在摔倒了吗？ (状态)
+        self.is_stationary = False  # 他现在静止吗？ (状态)
+        self.fall_alert_sent = False  # 已经为这次摔倒发过警报了吗？ (防止重复报警)
+        self.stationary_alert_sent = False  # 针对静止
+        self.no_helmet_alert_sent = False  # 针对没戴安全帽
         self.last_alert_time = 0 # Generic last alert time for this tracker (not currently used by can_send_alert which is global)
-        self.keypoints_history.append(keypoints)
+        self.keypoints_history.append(keypoints) # 把第一次发现他的关键点存起来
         self.has_helmet = True # Assume has helmet initially, detection will update this
         self.bbox = None # Store person's bounding box [x1, y1, x2, y2] from pose model
 
@@ -241,11 +242,11 @@ class BehaviorDetectionSystem:
         self.stats["model_status"] = "Loading..."
         try:
             self.pose_model = YOLO('yolov8x-pose.pt').to('cuda')
-            self.object_model = YOLO('yolov8n.pt').to('cuda')
-            
+            self.object_model = YOLO('helmet_100.pt').to('cuda')
+
             self.object_model_classes = self.object_model.names
             self.helmet_class_id = next((k for k, v in self.object_model_classes.items() if v.lower() in ['helmet', 'safety helmet']), None)
-            self.person_class_id = next((k for k, v in self.object_model_classes.items() if v.lower() == 'person'), None)
+            self.person_class_id = next((k for k, v in self.object_model_classes.items() if v.lower() in ['person', 'head']), None)
 
             if self.helmet_class_id is None:
                 self.add_log_message("[WARNING] 'helmet' class not found in object_model. Helmet detection will be illustrative/disabled.")
@@ -791,9 +792,20 @@ def generate_frames():
         # For now, minimal sleep to yield control, actual FPS depends on processing
         time.sleep(0.01) 
 
+# @app.route('/')
+# def index():
+#     return render_template('index.html', current_source=str(system.video_source))
+# http://127.0.0.1:5000/?key=610
+
+ADMIN_SECRET_KEY = "610"
+
 @app.route('/')
 def index():
-    return render_template('index.html', current_source=str(system.video_source))
+    user_key = request.args.get('key')
+    is_admin = (user_key == ADMIN_SECRET_KEY)
+    return render_template('index.html', 
+                           current_source=str(system.video_source),
+                           is_admin=is_admin)
 
 @app.route('/video_feed')
 def video_feed():
@@ -865,4 +877,10 @@ if __name__ == "__main__":
     print("Open http://127.0.0.1:5000 (or your server's IP) in your browser.")
     # use_reloader=False is crucial for threaded applications to avoid issues with model loading and thread management
     # threaded=True allows Flask to handle multiple requests concurrently (though Python's GIL limits true parallelism for CPU-bound tasks)
-    app.run(debug=True, host='0.0.0.0', port=5000, use_reloader=False, threaded=True)
+    app.run(debug=True, host='172.30.32.231', port=5000, use_reloader=False, threaded=True)
+
+# System Control web
+# Running on http://172.30.32.231:5000/?key=610
+
+# normal User
+# Running on http://172.30.32.231:5000
