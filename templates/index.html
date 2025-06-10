@@ -208,7 +208,6 @@
         .status-stopped { background-color: #fee2e2; color: #991b1b; border-color: #fecaca;} /* Reddish */
         .status-unknown { background-color: #e5e7eb; color: #4b5563; border-color: #d1d5db;} /* Neutral gray */
 
-
         /* Responsive adjustments */
         @media (max-width: 1200px) { /* Adjust breakpoint as needed */
              .video-container {
@@ -254,6 +253,7 @@
         </div>
 
         <div class="controls-stats-container">
+            {% if is_admin %}
             <div class="panel">
                 <h2>System Control</h2>
                 <div class="system-status status-unknown" id="systemStatus">Status: Initializing...</div> <!-- Initial class -->
@@ -264,6 +264,7 @@
                 <button id="startBtn">Start Detection</button>
                 <button id="stopBtn">Stop Detection</button>
             </div>
+            {% endif %}
 
             <div class="panel">
                 <h2>Live Statistics</h2>
@@ -353,7 +354,8 @@
                     statusText = 'Stopped';
                     statusClass = 'status-stopped';
                 }
-                systemStatusDiv.textContent = `Status: ${statusText} | Source: ${data.source || 'N/A'}`;
+                //systemStatusDiv.textContent = `Status: ${statusText} | Source: ${data.source || 'N/A'}`;
+                systemStatusDiv.textContent = `Status: ${statusText}`;
                 systemStatusDiv.className = `system-status ${statusClass}`; // Update class for styling
 
                 peopleCountEl.textContent = data.stats.people_count;
