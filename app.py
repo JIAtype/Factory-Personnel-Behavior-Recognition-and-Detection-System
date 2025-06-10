@@ -10,12 +10,66 @@ from collections import defaultdict, deque
 import queue # Keep queue for alerts if needed, or switch to simple list
 import math
 from PIL import Image # Will be used by Flask if sending PIL images, but cv2.imencode is better for MJPEG
+from opcua import ua, Server  # 导入OPC UA服务器功能
+import threading             # 我们需要线程来在后台运行服务器
 
 try:
     from ultralytics import YOLO
 except ImportError:
     print("Please install ultralytics: pip install ultralytics")
     exit(1)
+
+# --- OPC UA Setup ---
+
+# 创建一个全局变量来持有我们的OPC UA服务器和警报变量 ---
+opcua_server = None
+opcua_alert_variable = None
+
+# --- 3. 创建一个函数来启动OPC UA服务器 ---
+def start_opcua_server():
+    """这个函数会在一个独立的线程中运行，负责启动和维护OPC UA服务器"""
+    global opcua_server, opcua_alert_variable
+    
+    # --- 服务器配置 ---
+    # 创建服务器实例
+    opcua_server = Server()
+    
+    # 设置服务器地址。'0.0.0.0'表示网络上任何电脑都可以访问。4841是OPC UA的默认端口。
+    opcua_server.set_endpoint("opc.tcp://172.30.32.231:4841/SafetyServer/")
+
+    # 设置一个服务器名
+    opcua_server.set_server_name("Simple Safety Alert Server")
+    
+    # 注册一个命名空间，这就像给你的变量创建一个专属文件夹
+    uri = "http://mycompany.com/safety_alerts"
+    idx = opcua_server.register_namespace(uri)
+
+    # --- 创建我们要发送的变量 ---
+    # 在 'Objects' 节点下创建一个叫 'MyAlerts' 的对象
+    my_alerts_obj = opcua_server.nodes.objects.add_object(idx, "MyAlerts")
+    
+    # 在 'MyAlerts' 对象下，创建我们唯一的警报变量 'LatestAlert'
+    # 初始值为 0 (表示 '无警报')
+    opcua_alert_variable = my_alerts_obj.add_variable(idx, "LatestAlert", 0)
+    
+    # 必须设置这个变量为可写，这样我们才能修改它的值
+    opcua_alert_variable.set_writable()
+
+    try:
+        # --- 启动服务器 ---
+        opcua_server.start()
+        print("✅ OPC UA Server started at opc.tcp://172.30.32.231:4841/SafetyServer/")
+        # 让这个线程一直运行，直到主程序退出
+        while True:
+            time.sleep(1)
+            
+    except Exception as e:
+        print(f"Failed to start OPC UA Server: {e}")
+    finally:
+        # 如果循环退出（虽然正常情况不会），就关闭服务器
+        if opcua_server:
+            opcua_server.stop()
+            print("OPC UA Server stopped.")
 
 # --- PersonTracker Class ---
 class PersonTracker:
@@ -194,10 +248,9 @@ class BehaviorDetectionSystem:
     TRACKER_DISAPPEAR_SECONDS_NO_MATCH = 10 # If no match for this long, tracker is removed
     TRACKER_MATCH_MAX_DISTANCE_PX = 150 # Max distance (pixels) for matching detection to tracker
 
-    POSE_PERSON_CONF_THRESHOLD = 0.5
+    POSE_PERSON_CONF_THRESHOLD = 0.6
     OBJECT_HELMET_CONF_THRESHOLD = 0.4
-    OBJECT_PERSON_CONF_THRESHOLD = 0.5 # If using object model to also find persons
-
+    
     RECORDING_BUFFER_MAXLEN = 300 # Frames (e.g., 60s at 5fps, 10s at 30fps)
     RECORDING_VIDEO_FPS = 5.0 # Target FPS for saved alert videos
     # --- End Configuration Constants ---
@@ -205,7 +258,7 @@ class BehaviorDetectionSystem:
     def __init__(self, video_source="test_video.mp4"):
         self.video_source = video_source
         self.pose_model = None
-        self.object_model = None
+        self.helmet_model = None ## <-- 修改/MODIFIED: 不再需要 object_model 和 person_model, 只需要 helmet_model
         self.cap = None
         self.trackers = {}
         self.next_id = 0
@@ -241,19 +294,33 @@ class BehaviorDetectionSystem:
         self.add_log_message("[SYSTEM] Attempting to load models...")
         self.stats["model_status"] = "Loading..."
         try:
+            # Load the models and check if they are initialized properly
             self.pose_model = YOLO('yolov8x-pose.pt').to('cuda')
-            self.object_model = YOLO('helmet_100.pt').to('cuda')
+            if self.pose_model is None:
+                raise ValueError("Pose model failed to load.")
 
-            self.object_model_classes = self.object_model.names
-            self.helmet_class_id = next((k for k, v in self.object_model_classes.items() if v.lower() in ['helmet', 'safety helmet']), None)
-            self.person_class_id = next((k for k, v in self.object_model_classes.items() if v.lower() in ['person', 'head']), None)
+            ## <-- 修改/MODIFIED: 删除了 person_model 的加载，因为它是不必要的
+            # self.person_model = YOLO('yolov8n.pt').to('cuda')
+            # if self.person_model is None:
+            #     raise ValueError("Person model failed to load.")
 
+            self.helmet_model = YOLO('helmet_25.pt').to('cuda')
+            if self.helmet_model is None:
+                raise ValueError("Helmet model failed to load.")
+
+            # Access class names from the models
+            self.helmet_class_id = next((k for k, v in self.helmet_model.names.items() if v.lower() == 'helmet'), None)
+            ## <-- 修改/MODIFIED: 删除了 person_class_id 的获取
+            # self.person_class_id = next((k for k, v in self.person_model.names.items() if v.lower() == 'person'), None)
+            
             if self.helmet_class_id is None:
-                self.add_log_message("[WARNING] 'helmet' class not found in object_model. Helmet detection will be illustrative/disabled.")
-            if self.person_class_id is None:
-                self.add_log_message("[ERROR] 'person' class not found in object_model. This is crucial for some functionalities.")
-                self.stats["model_status"] = "Error: Person class missing"
-                return False
+                self.add_log_message("[WARNING] 'helmet' class not found in helmet_model.")
+            
+            # ## <-- 修改/MODIFIED: 删除了对 person_class_id 的检查
+            # if self.person_class_id is None:
+            #     self.add_log_message("[ERROR] 'person' class not found in object_model.")
+            #     self.stats["model_status"] = "Error: Person class missing"
+            #     return False
             
             self.add_log_message("[INFO] Models loaded successfully.")
             self.stats["model_status"] = "Loaded"
@@ -261,8 +328,10 @@ class BehaviorDetectionSystem:
         except Exception as e:
             self.add_log_message(f"[ERROR] Failed to load models: {str(e)}")
             self.stats["model_status"] = f"Error: {str(e)}"
-            self.pose_model = None # Ensure models are None if loading failed
-            self.object_model = None
+            self.pose_model = None
+            self.helmet_model = None
+            ## <-- 修改/MODIFIED: 确保在出错时清理所有模型变量
+            # self.person_model = None 
             return False
 
     def start_detection(self):
@@ -270,7 +339,8 @@ class BehaviorDetectionSystem:
             self.add_log_message("[INFO] Detection already running.")
             return
 
-        if not self.pose_model or not self.object_model:
+        ## <-- 修改/MODIFIED: 更新了模型检查的逻辑
+        if not self.pose_model or not self.helmet_model:
             if not self.load_models():
                 self.stats["detection_status"] = "Stopped (Model Load Failed)"
                 return
@@ -280,7 +350,6 @@ class BehaviorDetectionSystem:
             # Convert to int if it's a digit string (webcam ID), else use as string (path/URL)
             capture_source = int(self.video_source) if str(self.video_source).isdigit() else self.video_source
             self.cap = cv2.VideoCapture(capture_source, cv2.CAP_FFMPEG)
-            # self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception as e:
              self.add_log_message(f"[ERROR] OpenCV Error during VideoCapture init: {e}")
              self.cap = None
@@ -378,39 +447,36 @@ class BehaviorDetectionSystem:
             frame_copy_for_buffer = frame.copy()
             self.recording_buffer.append((time.time(), frame_copy_for_buffer))
 
-            # 1. Pose Detection
+            # 1. Pose Detection (this finds people and their keypoints)
             pose_results = self.pose_model(frame, verbose=False, conf=self.POSE_PERSON_CONF_THRESHOLD)
             
             current_person_detections_for_tracking = []
             for r in pose_results:
                 if r.keypoints is not None and r.boxes is not None:
-                    # .data ensures we get tensor data, .cpu().numpy() for numpy array
                     keypoints_data = r.keypoints.data.cpu().numpy() 
-                    boxes_data = r.boxes.data.cpu().numpy() # [x1, y1, x2, y2, conf, cls]
+                    boxes_data = r.boxes.data.cpu().numpy() 
                     
                     for i, (kpts, box_coords) in enumerate(zip(keypoints_data, boxes_data)):
-                        # Pose model usually detects persons (class 0)
-                        # Rely on confidence from boxes_data
                         if box_coords[4] > self.POSE_PERSON_CONF_THRESHOLD: 
                             current_person_detections_for_tracking.append({
-                                'keypoints': kpts, # kpts are (N_kpts, 3) with x,y,conf
-                                'box': box_coords[:4], # Person bbox [x1,y1,x2,y2]
+                                'keypoints': kpts,
+                                'box': box_coords[:4],
                                 'id': None
                             })
             self.update_trackers(current_person_detections_for_tracking)
 
-            # 2. Object Detection (for Helmets)
+            # 2. Helmet Detection
             detected_helmets_boxes = []
-            if self.helmet_class_id is not None: # Only if helmet class is available and configured
-                object_results = self.object_model(frame, verbose=False, classes=[self.helmet_class_id], conf=self.OBJECT_HELMET_CONF_THRESHOLD)
-                for r_obj in object_results:
+            if self.helmet_class_id is not None:
+                ## <-- 修改/MODIFIED: 这是最关键的修改，使用 self.helmet_model 替换了旧的 self.object_model
+                helmet_results = self.helmet_model(frame, verbose=False, classes=[self.helmet_class_id], conf=self.OBJECT_HELMET_CONF_THRESHOLD)
+                for r_obj in helmet_results:
                     for box in r_obj.boxes:
-                        # Class check is implicitly handled by `classes` arg in model call, but double check for safety
                         if box.cls == self.helmet_class_id and box.conf > self.OBJECT_HELMET_CONF_THRESHOLD:
                             detected_helmets_boxes.append(box.xyxy[0].cpu().numpy().astype(int))
             
             # 3. Associate Helmets with Tracked Persons
-            for tracker in self.trackers.values(): # Iterate over a copy of values if modification occurs
+            for tracker in self.trackers.values():
                 tracker.has_helmet = False # Reset for current frame, assume no helmet
                 if not tracker.keypoints_history or self.helmet_class_id is None: continue
 
@@ -426,18 +492,17 @@ class BehaviorDetectionSystem:
 
             with self.detection_lock:
                 self.latest_frame = annotated_frame.copy()
-            
-            # No artificial delay needed here, processing speed will dictate FPS.
-            # time.sleep(0.01) 
 
-        # Loop ended, ensure cap is released if it was open
         if self.cap and self.cap.isOpened():
             self.cap.release()
         self.add_log_message("[INFO] Detection loop finished.")
-        if self.stats["detection_status"] == "Running": # If not stopped by user or error
+        if self.stats["detection_status"] == "Running":
             self.stats["detection_status"] = "Stopped (Loop Ended)"
 
-
+    # ... [后面的代码无需修改，为了简洁性省略] ...
+    # The rest of your code (update_trackers, draw_annotations_and_handle_alerts, Flask routes, etc.)
+    # does not need changes based on this model refactoring, so I'm omitting it for brevity.
+    # Just paste the corrected code above, and keep the rest of your original file from `update_trackers` onwards.
     def update_trackers(self, detections):
         # Iterate over a list of items to allow deletion from self.trackers
         current_tracker_ids = list(self.trackers.keys())
@@ -464,12 +529,6 @@ class BehaviorDetectionSystem:
                 detection['id'] = tracker_id # Assign tracker ID to the matched detection
                 matched_detection_indices.add(best_match_idx)
             else:
-                # No match found for this tracker
-                # Consider disappeared if no detection for TRACKER_DISAPPEAR_SECONDS_NO_MATCH seconds
-                # This simple tracker doesn't have a robust "time_last_seen" for unmatched trackers.
-                # It relies on last_movement_time which is updated only on match.
-                # A more direct approach: add a `last_seen_time` to tracker, update it always.
-                # For now, the original logic: if no movement and no match for X seconds.
                 if time.time() - tracker.last_movement_time > self.TRACKER_DISAPPEAR_SECONDS_NO_MATCH :
                      del self.trackers[tracker_id]
 
@@ -498,7 +557,6 @@ class BehaviorDetectionSystem:
             current_valid_kps = current_keypoints[current_keypoints[:, 2] > 0.5][:, :2] # x, y
 
             if last_valid_kps.shape[0] == 0 or current_valid_kps.shape[0] == 0:
-                # Fallback to bounding box center distance if keypoints are insufficient
                 if tracker.bbox is not None and 'box' in detection and detection['box'] is not None:
                     b1_cx = (tracker.bbox[0] + tracker.bbox[2]) / 2
                     b1_cy = (tracker.bbox[1] + tracker.bbox[3]) / 2
@@ -507,22 +565,18 @@ class BehaviorDetectionSystem:
                     return np.linalg.norm(np.array([b1_cx, b1_cy]) - np.array([b2_cx, b2_cy]))
                 return float('inf')
             
-            # Calculate distance based on the center of valid keypoints
             last_center = np.mean(last_valid_kps, axis=0)
             current_center = np.mean(current_valid_kps, axis=0)
             return np.linalg.norm(last_center - current_center)
 
-        except (IndexError, ValueError) as e: # More specific exceptions
+        except (IndexError, ValueError) as e: 
             self.add_log_message(f"[DEBUG] Error in calculate_detection_distance: {e}")
             return float('inf')
-        except Exception as e: # Catch-all for unexpected issues
+        except Exception as e:
             self.add_log_message(f"[ERROR] Unexpected error in calculate_detection_distance: {e}")
             return float('inf')
 
     def draw_annotations_and_handle_alerts(self, frame):
-        # Iterate over a list of items in case trackers dict changes (though less likely here)
-        # However, tracker attributes are modified.
-        
         current_people = 0
         current_fallen = 0
         current_stationary = 0
@@ -530,14 +584,12 @@ class BehaviorDetectionSystem:
         
         any_alert_condition_in_frame = False
 
-        # Use list(self.trackers.items()) for safe iteration if trackers could be modified elsewhere,
-        # but here it's within the single detection thread. Modifying tracker attributes is fine.
         for tracker_id, tracker in self.trackers.items():
             if not tracker.keypoints_history: continue
             current_people +=1
             
             box_to_draw = tracker.bbox 
-            if box_to_draw is None: # Fallback if bbox from pose wasn't stored/valid
+            if box_to_draw is None:
                  valid_keypoints = np.array(tracker.keypoints_history[-1])
                  valid_keypoints = valid_keypoints[valid_keypoints[:, 2] > 0.5]
                  if len(valid_keypoints) > 0:
@@ -547,7 +599,6 @@ class BehaviorDetectionSystem:
             color = (0, 255, 0) # Green default
             status_texts = [f"P{tracker_id}"]
 
-            # Fall Detection
             if tracker.is_fallen:
                 color = (0, 0, 255)  # Red
                 status_texts.append("FALLEN")
@@ -557,7 +608,6 @@ class BehaviorDetectionSystem:
                     self.trigger_alert(f"FALLEN - Person {tracker_id}", tracker_id, "fall")
                     tracker.fall_alert_sent = True
             
-            # Stationary Detection (only if not fallen)
             elif tracker.is_stationary:
                 color = (0, 165, 255)  # Orange
                 status_texts.append("STATIONARY")
@@ -567,7 +617,6 @@ class BehaviorDetectionSystem:
                     self.trigger_alert(f"STATIONARY - Person {tracker_id}", tracker_id, "stationary")
                     tracker.stationary_alert_sent = True
             
-            # Helmet Detection (can be combined with other states)
             if self.helmet_class_id is not None:
                 if not tracker.has_helmet:
                     if color == (0, 255, 0): color = (255, 0, 255) # Purple if no other alert color
@@ -577,48 +626,37 @@ class BehaviorDetectionSystem:
                     if not tracker.no_helmet_alert_sent and self.can_send_alert(tracker_id, "no_helmet"):
                         self.trigger_alert(f"NO HELMET - Person {tracker_id}", tracker_id, "no_helmet")
                         tracker.no_helmet_alert_sent = True
-                else: # Has helmet
-                    # status_texts.append("HELMET OK") # Can be verbose
-                    if tracker.no_helmet_alert_sent: # If was previously alerted for no helmet
-                        tracker.no_helmet_alert_sent = False # Reset alert status
+                else:
+                    if tracker.no_helmet_alert_sent:
+                        tracker.no_helmet_alert_sent = False
 
             if box_to_draw is not None:
                 x1, y1, x2, y2 = map(int, box_to_draw[:4])
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 
-                # Optional: Draw head region for debugging
-                # head_r = tracker.get_head_region()
-                # if head_r: cv2.rectangle(frame, (head_r[0], head_r[1]), (head_r[2], head_r[3]), (255,255,0), 1)
-
                 text_y_pos = y1 - 7
                 for i, text_line in enumerate(status_texts):
                     cv2.putText(frame, text_line, (x1, text_y_pos - (i * 15)), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
         
-        # Update global stats under lock
         with self.detection_lock:
             self.stats["people_count"] = current_people
             self.stats["fallen_count"] = current_fallen
             self.stats["stationary_count"] = current_stationary
             self.stats["no_helmet_count"] = current_no_helmet
 
-        # Manage alert recording state
         self.an_alert_condition_exists = any_alert_condition_in_frame
         if self.an_alert_condition_exists and not self.is_recording_alert_active:
-            self.is_recording_alert_active = True # Flag that a recording process is now active
-            # Find the first alert message that triggered this recording session
+            self.is_recording_alert_active = True
             first_alert_msg_for_filename = "alert_event"
-            # Check self.alerts (which is prepended)
             if self.alerts:
-                 # Heuristic: find a recent PERSON-specific alert message
-                for alert_text in list(self.alerts)[:5]: # Check a few recent alerts
+                for alert_text in list(self.alerts)[:5]:
                     if " - Person " in alert_text:
                         first_alert_msg_for_filename = alert_text.split("] ",1)[1]
                         break
             
             threading.Thread(target=self.save_alert_recording, args=(first_alert_msg_for_filename,)).start()
 
-        # Display overall stats on frame
         cv2.putText(frame, f"People: {current_people}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220,220,220), 2)
         cv2.putText(frame, f"Fallen: {current_fallen}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255) if current_fallen else (220,220,220), 2)
         cv2.putText(frame, f"Stationary: {current_stationary}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,165,255) if current_stationary else (220,220,220), 2)
@@ -636,24 +674,41 @@ class BehaviorDetectionSystem:
         return False
 
     def trigger_alert(self, message, person_id, alert_type):
+        global opcua_alert_variable # 引用全局的OPC UA变量
+
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         log_message = f"[{timestamp}] ALERT: {message}"
         
-        with self.detection_lock: # Protect alerts deque
+        with self.detection_lock:
             self.alerts.appendleft(log_message)
-        print(log_message) # Console log
+        print(log_message)
+
+        # --- 定义警报代码 ---
+        alert_code = 0 # 默认是0 (无警报或未知警报)
+        if alert_type == "fall":
+            alert_code = 1
+        elif alert_type == "no_helmet":
+            alert_code = 2
+        elif alert_type == "stationary":
+            alert_code = 3
+
+        # --- 直接修改OPC UA服务器上的变量值 ---
+        if opcua_alert_variable and alert_code != 0:
+            try:
+                print(f"OPC UA: Setting LatestAlert to {alert_code}")
+                # 使用 set_value 来更新变量的值
+                opcua_alert_variable.set_value(alert_code)
+            except Exception as e:
+                print(f"❌ OPC UA: Failed to set value: {e}")
 
     def save_alert_recording(self, alert_message_for_filename="alert_event"):
         self.add_log_message(f"[INFO] Alert recording triggered by: {alert_message_for_filename}")
         
-        # Snapshot the buffer at the time of alert triggering
-        # Note: buffer continues to fill, so this is a snapshot.
-        # A more advanced system might mark a point in a continuous recording stream.
         frames_to_save_data = list(self.recording_buffer)
         
         if not frames_to_save_data:
             self.add_log_message("[WARNING] Recording buffer empty when save_alert_recording called.")
-            self.is_recording_alert_active = False # Reset flag
+            self.is_recording_alert_active = False
             return
 
         timestamp_file = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -668,12 +723,7 @@ class BehaviorDetectionSystem:
         _ , first_frame_props = frames_to_save_data[0]
         height, width = first_frame_props.shape[:2]
         
-        # Use configured FPS for saving video
         out_fps = self.RECORDING_VIDEO_FPS
-        # Alternative: Estimate FPS from buffer timestamps if desired
-        # if len(frames_to_save_data) > 1:
-        #     time_diff = frames_to_save_data[-1][0] - frames_to_save_data[0][0]
-        #     if time_diff > 0: out_fps = min(max(len(frames_to_save_data) / time_diff, 1.0), 15.0)
         
         fourcc = cv2.VideoWriter_fourcc(*'XVID')
         video_writer = cv2.VideoWriter(video_filename, fourcc, out_fps, (width, height))
@@ -687,8 +737,8 @@ class BehaviorDetectionSystem:
         alert_info = {
             'timestamp': timestamp_file,
             'triggering_alert_message': alert_message_for_filename,
-            'video_file': os.path.basename(video_filename), # Store only filename
-            'video_path': video_filename, # Full path for server-side access
+            'video_file': os.path.basename(video_filename),
+            'video_path': video_filename,
             'duration_seconds': len(frames_to_save_data) / out_fps if out_fps > 0 else 0,
             'source_video': str(self.video_source),
             'frames_saved': len(frames_to_save_data)
@@ -700,29 +750,28 @@ class BehaviorDetectionSystem:
         except Exception as e:
             self.add_log_message(f"[ERROR] Failed to save alert JSON: {e}")
         
-        self.is_recording_alert_active = False # Reset flag, allowing new recordings if new alerts occur
+        self.is_recording_alert_active = False
 
     def add_log_message(self, message):
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        # Ensure it's not an ALERT message which has its own format
         if not message.startswith("[") and "ALERT:" not in message: 
             log_entry = f"[{timestamp}] [SYSTEM] {message}"
-        elif not message.startswith("["): # For other non-ALERT messages without timestamp
+        elif not message.startswith("["):
             log_entry = f"[{timestamp}] {message}"
-        else: # Already formatted
+        else:
             log_entry = message
         
-        print(log_entry) # Console for live debugging
-        with self.detection_lock: # Protect alerts deque
+        print(log_entry)
+        with self.detection_lock:
             self.alerts.appendleft(log_entry)
 
     def get_status(self):
-        with self.detection_lock: # Ensure consistent read of stats and alerts
+        with self.detection_lock:
             stats_copy = self.stats.copy()
             alerts_list = list(self.alerts)
         return {
             "running": self.running,
-            "source": str(self.video_source), # Ensure source is string
+            "source": str(self.video_source),
             "is_file": self.is_video_file,
             "stats": stats_copy,
             "alerts": alerts_list
@@ -743,15 +792,6 @@ class BehaviorDetectionSystem:
 app = Flask(__name__)
 
 DEFAULT_VIDEO_SOURCE = "rtsp://admin:Admin4321@172.30.40.125/554/live/stream1"
-# DEFAULT_VIDEO_SOURCE = "Video2.mp4" 
-# # Default to webcam '0' for broader compatibility
-# Example: DEFAULT_VIDEO_SOURCE = "your_video_file.mp4"
-# Example: DEFAULT_VIDEO_SOURCE = "rtsp://user:pass@ip_address/stream"
-
-# Check if a specific video file is intended and exists
-# if not str(DEFAULT_VIDEO_SOURCE).isdigit() and not os.path.exists(DEFAULT_VIDEO_SOURCE):
-# print(f"[WARNING] Default video source '{DEFAULT_VIDEO_SOURCE}' not found or not a webcam ID. Please check.")
-
 system = BehaviorDetectionSystem(video_source=DEFAULT_VIDEO_SOURCE)
 
 def generate_frames():
@@ -760,19 +800,17 @@ def generate_frames():
         frame_to_send = None
         with system.detection_lock:
             if system.latest_frame is not None:
-                frame_to_send = system.latest_frame.copy() # Copy to operate outside lock
+                frame_to_send = system.latest_frame.copy()
         
         if frame_to_send is None:
-            # Placeholder frame if system is stopped or frame not ready
             black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
             status_text = "System Initializing..."
-            if system.stats: # Check if stats initialized
+            if system.stats:
                 status_text = system.stats.get("detection_status", "Initializing...")
                 if not system.running and system.stats.get("model_status", "").startswith("Error"):
                     status_text = f"Model Error: {system.stats['model_status'].split(': ',1)[-1]}"
                 elif not system.running and system.stats.get("detection_status", "").startswith("Stopped (Source Error)"):
                      status_text = "Video Source Error"
-
 
             cv2.putText(black_frame, status_text, (30, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             ret, buffer = cv2.imencode('.jpg', black_frame)
@@ -780,22 +818,14 @@ def generate_frames():
             ret, buffer = cv2.imencode('.jpg', frame_to_send)
 
         if not ret:
-            time.sleep(0.05) # Wait a bit if encoding fails
+            time.sleep(0.05)
             continue
         
         frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
         
-        # Let the client pull frames as fast as it can, or sync with detection rate
-        # time.sleep(1 / system.TARGET_STREAM_FPS if system.TARGET_STREAM_FPS > 0 else 0.03)
-        # For now, minimal sleep to yield control, actual FPS depends on processing
         time.sleep(0.01) 
-
-# @app.route('/')
-# def index():
-#     return render_template('index.html', current_source=str(system.video_source))
-# http://127.0.0.1:5000/?key=610
 
 ADMIN_SECRET_KEY = "610"
 
@@ -819,25 +849,17 @@ def start_detection_route():
     
     data = request.get_json()
     new_source = data.get('source', system.video_source)
-    if str(new_source) != str(system.video_source): # Check if source actually changed
+    if str(new_source) != str(system.video_source):
         if not system.update_video_source(new_source):
-            # update_video_source should not fail if system is not running, but good practice
             return jsonify({"message": "Failed to update source before starting.", "status": "error"}), 500
 
-    # system.start_detection() itself is blocking until source is opened or fails.
-    # The detection_loop then runs in a new thread.
-    # We can run start_detection in a thread to make this route non-blocking.
     threading.Thread(target=system.start_detection, daemon=True).start()
-    # Give a moment for the system.running flag and initial status to be set
     time.sleep(0.5) 
     if system.running:
         return jsonify({"message": "Detection starting...", "status": "starting"})
     else:
-        # If system.running is still false, it means start_detection failed (e.g. model load, video source)
-        # The specific error should be in system.stats or logs
         error_message = system.stats.get("detection_status", "Failed to start (Unknown error)")
         if "Model Load Failed" in error_message or "Source Error" in error_message:
-             # Add more specific message from stats if available
             specific_error = system.stats.get("model_status", "") if "Model" in error_message else error_message
             return jsonify({"message": f"Failed to start: {specific_error}", "status": "error"}), 500
         return jsonify({"message": "Failed to start detection.", "status": "error"}), 500
@@ -848,7 +870,7 @@ def stop_detection_route():
     if not system.running:
         return jsonify({"message": "Detection not running.", "status": "already_stopped"}), 400
     
-    system.stop_detection() # This will set self.running = False and join the thread.
+    system.stop_detection()
     return jsonify({"message": "Detection stopping...", "status": "stopping"})
 
 @app.route('/status', methods=['GET'])
@@ -862,21 +884,28 @@ def update_source_route():
     
     data = request.get_json()
     new_source = data.get('source')
-    if new_source is None or str(new_source).strip() == "": # Check for empty or None source
+    if new_source is None or str(new_source).strip() == "":
         return jsonify({"success": False, "message": "No source provided."}), 400
     
-    if system.update_video_source(str(new_source)): # Ensure source is string
+    if system.update_video_source(str(new_source)):
          return jsonify({"success": True, "message": f"Source updated to {new_source}."})
     else:
-         # This case should ideally not be reached if system.running is false
          return jsonify({"success": False, "message": "Failed to update source (unexpected)."}), 500
 
-
 if __name__ == "__main__":
+    print("Starting application...")
+
+    # --- 启动OPC UA服务器线程 ---
+    # 创建一个线程来运行 start_opcua_server 函数
+    # daemon=True 意味着当主程序退出时，这个线程也会自动关闭
+    opcua_thread = threading.Thread(target=start_opcua_server, daemon=True)
+    opcua_thread.start()
+
+    # 等待一小会儿，确保服务器有足够的时间启动
+    time.sleep(2)
+
     print(f"Flask app starting... Default video source: {DEFAULT_VIDEO_SOURCE}")
     print("Open http://127.0.0.1:5000 (or your server's IP) in your browser.")
-    # use_reloader=False is crucial for threaded applications to avoid issues with model loading and thread management
-    # threaded=True allows Flask to handle multiple requests concurrently (though Python's GIL limits true parallelism for CPU-bound tasks)
     app.run(debug=True, host='172.30.32.231', port=5000, use_reloader=False, threaded=True)
 
 # System Control web
