@@ -23,12 +23,13 @@ except ImportError:
 
 # 创建一个全局变量来持有我们的OPC UA服务器和警报变量 ---
 opcua_server = None
-opcua_alert_variable = None
+opcua_fall_variable = None
+opcua_helmet_variable = None
 
 # --- 3. 创建一个函数来启动OPC UA服务器 ---
 def start_opcua_server():
     """这个函数会在一个独立的线程中运行，负责启动和维护OPC UA服务器"""
-    global opcua_server, opcua_alert_variable
+    global opcua_server, opcua_fall_variable, opcua_helmet_variable
     
     # --- 服务器配置 ---
     # 创建服务器实例
@@ -50,10 +51,12 @@ def start_opcua_server():
     
     # 在 'MyAlerts' 对象下，创建我们唯一的警报变量 'LatestAlert'
     # 初始值为 0 (表示 '无警报')
-    opcua_alert_variable = my_alerts_obj.add_variable(idx, "LatestAlert", 0)
-    
     # 必须设置这个变量为可写，这样我们才能修改它的值
-    opcua_alert_variable.set_writable()
+    opcua_fall_variable = my_alerts_obj.add_variable(idx, "FallStatus", 0)
+    opcua_fall_variable.set_writable()
+
+    opcua_helmet_variable = my_alerts_obj.add_variable(idx, "NoHelmetStatus", 0)
+    opcua_helmet_variable.set_writable()
 
     try:
         # --- 启动服务器 ---
@@ -249,10 +252,10 @@ class BehaviorDetectionSystem:
     TRACKER_MATCH_MAX_DISTANCE_PX = 150 # Max distance (pixels) for matching detection to tracker
 
     POSE_PERSON_CONF_THRESHOLD = 0.6
-    OBJECT_HELMET_CONF_THRESHOLD = 0.4
+    OBJECT_HELMET_CONF_THRESHOLD = 0.3
     
-    RECORDING_BUFFER_MAXLEN = 300 # Frames (e.g., 60s at 5fps, 10s at 30fps)
-    RECORDING_VIDEO_FPS = 5.0 # Target FPS for saved alert videos
+    RECORDING_BUFFER_MAXLEN = 300 # Frames (e.g., 60s at 5fps, 10s at 30fps)每秒录制 5 帧（即 5fps），那么 300 帧就是 60 秒
+    RECORDING_VIDEO_FPS = 5.0 # Target FPS for saved alert videos设置保存的视频的目标帧率（Frames Per Second），即每秒录制多少帧。
     # --- End Configuration Constants ---
 
     def __init__(self, video_source="test_video.mp4"):
@@ -299,28 +302,15 @@ class BehaviorDetectionSystem:
             if self.pose_model is None:
                 raise ValueError("Pose model failed to load.")
 
-            ## <-- 修改/MODIFIED: 删除了 person_model 的加载，因为它是不必要的
-            # self.person_model = YOLO('yolov8n.pt').to('cuda')
-            # if self.person_model is None:
-            #     raise ValueError("Person model failed to load.")
-
             self.helmet_model = YOLO('helmet_25.pt').to('cuda')
             if self.helmet_model is None:
                 raise ValueError("Helmet model failed to load.")
 
             # Access class names from the models
             self.helmet_class_id = next((k for k, v in self.helmet_model.names.items() if v.lower() == 'helmet'), None)
-            ## <-- 修改/MODIFIED: 删除了 person_class_id 的获取
-            # self.person_class_id = next((k for k, v in self.person_model.names.items() if v.lower() == 'person'), None)
             
             if self.helmet_class_id is None:
                 self.add_log_message("[WARNING] 'helmet' class not found in helmet_model.")
-            
-            # ## <-- 修改/MODIFIED: 删除了对 person_class_id 的检查
-            # if self.person_class_id is None:
-            #     self.add_log_message("[ERROR] 'person' class not found in object_model.")
-            #     self.stats["model_status"] = "Error: Person class missing"
-            #     return False
             
             self.add_log_message("[INFO] Models loaded successfully.")
             self.stats["model_status"] = "Loaded"
@@ -330,8 +320,6 @@ class BehaviorDetectionSystem:
             self.stats["model_status"] = f"Error: {str(e)}"
             self.pose_model = None
             self.helmet_model = None
-            ## <-- 修改/MODIFIED: 确保在出错时清理所有模型变量
-            # self.person_model = None 
             return False
 
     def start_detection(self):
@@ -339,7 +327,6 @@ class BehaviorDetectionSystem:
             self.add_log_message("[INFO] Detection already running.")
             return
 
-        ## <-- 修改/MODIFIED: 更新了模型检查的逻辑
         if not self.pose_model or not self.helmet_model:
             if not self.load_models():
                 self.stats["detection_status"] = "Stopped (Model Load Failed)"
@@ -347,7 +334,6 @@ class BehaviorDetectionSystem:
 
         self.add_log_message(f"[INFO] Attempting to open video source: {self.video_source}")
         try:
-            # Convert to int if it's a digit string (webcam ID), else use as string (path/URL)
             capture_source = int(self.video_source) if str(self.video_source).isdigit() else self.video_source
             self.cap = cv2.VideoCapture(capture_source, cv2.CAP_FFMPEG)
         except Exception as e:
@@ -388,7 +374,6 @@ class BehaviorDetectionSystem:
             self.latest_frame = None
         
         self.trackers.clear()
-        # Reset relevant stats, keep model status
         with self.detection_lock:
             self.stats.update({
                 "people_count": 0, "fallen_count": 0,
@@ -468,7 +453,6 @@ class BehaviorDetectionSystem:
             # 2. Helmet Detection
             detected_helmets_boxes = []
             if self.helmet_class_id is not None:
-                ## <-- 修改/MODIFIED: 这是最关键的修改，使用 self.helmet_model 替换了旧的 self.object_model
                 helmet_results = self.helmet_model(frame, verbose=False, classes=[self.helmet_class_id], conf=self.OBJECT_HELMET_CONF_THRESHOLD)
                 for r_obj in helmet_results:
                     for box in r_obj.boxes:
@@ -499,10 +483,6 @@ class BehaviorDetectionSystem:
         if self.stats["detection_status"] == "Running":
             self.stats["detection_status"] = "Stopped (Loop Ended)"
 
-    # ... [后面的代码无需修改，为了简洁性省略] ...
-    # The rest of your code (update_trackers, draw_annotations_and_handle_alerts, Flask routes, etc.)
-    # does not need changes based on this model refactoring, so I'm omitting it for brevity.
-    # Just paste the corrected code above, and keep the rest of your original file from `update_trackers` onwards.
     def update_trackers(self, detections):
         # Iterate over a list of items to allow deletion from self.trackers
         current_tracker_ids = list(self.trackers.keys())
@@ -540,7 +520,6 @@ class BehaviorDetectionSystem:
                 self.trackers[self.next_id] = new_tracker
                 detection['id'] = self.next_id # Also mark this detection as assigned
                 self.next_id = (self.next_id + 1) % 100000 # Cycle IDs
-
 
     def calculate_detection_distance(self, tracker, detection):
         if not tracker.keypoints_history: return float('inf')
@@ -657,6 +636,27 @@ class BehaviorDetectionSystem:
             
             threading.Thread(target=self.save_alert_recording, args=(first_alert_msg_for_filename,)).start()
 
+        if opcua_server:
+            try:
+                # 如果当前帧有人摔倒，FallStatus信号为1，否则为0
+                fall_signal = 1 if current_fallen > 0 else 0
+                if opcua_fall_variable is not None:
+                    # 检查当前值是否与要设置的值不同，避免不必要的写入
+                    if opcua_fall_variable.get_value() != fall_signal:
+                        print(f"[OPC UA] Setting FallSignal to {fall_signal}")
+                        opcua_fall_variable.set_value(fall_signal)
+                
+                # 如果当前帧有人未戴安全帽，NoHelmetStatus信号为1，否则为0
+                helmet_signal = 1 if current_no_helmet > 0 else 0
+                if opcua_helmet_variable is not None:
+                    # 检查当前值是否与要设置的值不同
+                    if opcua_helmet_variable.get_value() != helmet_signal:
+                        print(f"[OPC UA] Setting HelmetSignal to {fall_signal}")
+                        opcua_helmet_variable.set_value(helmet_signal)
+
+            except Exception as e:
+                print(f"❌ OPC UA: Failed to set values in main loop: {e}")
+
         cv2.putText(frame, f"People: {current_people}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220,220,220), 2)
         cv2.putText(frame, f"Fallen: {current_fallen}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255) if current_fallen else (220,220,220), 2)
         cv2.putText(frame, f"Stationary: {current_stationary}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,165,255) if current_stationary else (220,220,220), 2)
@@ -674,7 +674,6 @@ class BehaviorDetectionSystem:
         return False
 
     def trigger_alert(self, message, person_id, alert_type):
-        global opcua_alert_variable # 引用全局的OPC UA变量
 
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         log_message = f"[{timestamp}] ALERT: {message}"
@@ -682,24 +681,6 @@ class BehaviorDetectionSystem:
         with self.detection_lock:
             self.alerts.appendleft(log_message)
         print(log_message)
-
-        # --- 定义警报代码 ---
-        alert_code = 0 # 默认是0 (无警报或未知警报)
-        if alert_type == "fall":
-            alert_code = 1
-        elif alert_type == "no_helmet":
-            alert_code = 2
-        elif alert_type == "stationary":
-            alert_code = 3
-
-        # --- 直接修改OPC UA服务器上的变量值 ---
-        if opcua_alert_variable and alert_code != 0:
-            try:
-                print(f"OPC UA: Setting LatestAlert to {alert_code}")
-                # 使用 set_value 来更新变量的值
-                opcua_alert_variable.set_value(alert_code)
-            except Exception as e:
-                print(f"❌ OPC UA: Failed to set value: {e}")
 
     def save_alert_recording(self, alert_message_for_filename="alert_event"):
         self.add_log_message(f"[INFO] Alert recording triggered by: {alert_message_for_filename}")
