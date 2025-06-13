@@ -206,16 +206,13 @@ class PersonTracker:
                 visible_head_kpts.append(keypoints[i][:2])
         
         if not visible_head_kpts:
-            # Fallback: use area above shoulders if head keypoints are not visible, using person's bbox
-            # This is a rough estimate and might not be accurate if person is bent over.
+            # Fallback logic remains the same...
             if self.bbox is not None:
                 x1, y1, x2, y2 = map(int, self.bbox[:4])
-                # Estimate head as top 20-25% of the person's bounding box height
                 head_height_ratio = 0.25 
                 head_y1 = y1
                 head_y2 = y1 + (y2 - y1) * head_height_ratio
-                # Head width can be approximated from bbox width, or a bit narrower
-                head_x1 = x1 + (x2 - x1) * 0.1 # Indent a bit
+                head_x1 = x1 + (x2 - x1) * 0.1
                 head_x2 = x2 - (x2 - x1) * 0.1
                 return (int(head_x1), int(head_y1), int(head_x2), int(head_y2))
             return None
@@ -224,28 +221,38 @@ class PersonTracker:
         min_x, min_y = np.min(visible_head_kpts_np, axis=0)
         max_x, max_y = np.max(visible_head_kpts_np, axis=0)
 
+        # --- 核心修改区域 ---
+        # 旧的逻辑问题很大，我们用新的逻辑替换它
+        
         width = max_x - min_x
-        height = max_y - min_y
-        
-        padding_w = width * 0.35  # Increased padding for width
-        padding_h_up = height * 1.0 # More padding upwards for helmet
-        padding_h_down = height * 0.25 # Padding downwards
+        height = max_y - min_y # 我们现在需要 height 来计算垂直中心
 
-        hx1 = int(min_x - padding_w)
-        hy1 = int(min_y - padding_h_up)
-        hx2 = int(max_x + padding_w)
-        hy2 = int(max_y + padding_h_down)
+        # --- 修改 center_y 的定义 ---
+        center_x = min_x + width / 2
+        center_y = min_y + height / 2
         
-        # Ensure coordinates are positive
+        # 估算头部+安全帽的尺寸
+        # 宽度可以稍微放大一点
+        box_width = width * 1.4 
+        # 高度应该是宽度的某个倍数，因为头+安全帽是比较高的
+        box_height = width * 1.8 # <--- 这是关键参数，可以调整
+
+        # 计算新的坐标
+        # 向上扩展大部分，向下扩展一小部分
+        hx1 = int(center_x - box_width / 2)
+        hy1 = int(center_y - box_height * 0.65) # 从眼睛中心向上扩展 65%
+        hy2 = int(center_y + box_height * 0.35) # 从眼睛中心向下扩展 35%
+        hx2 = int(center_x + box_width / 2)
+
+        # 确保坐标是正数
         hx1, hy1 = max(0, hx1), max(0, hy1)
 
         return (hx1, hy1, hx2, hy2)
 
-
 # --- BehaviorDetectionSystem Class ---
 class BehaviorDetectionSystem:
     # --- Configuration Constants ---
-    HELMET_IOU_THRESHOLD = 0.15
+    HELMET_IOU_THRESHOLD = 0.6
     ALERT_COOLDOWN_SECONDS = 60 # Cooldown per person per alert type
     
     TRACKER_DISAPPEAR_SECONDS_NO_MATCH = 10 # If no match for this long, tracker is removed
@@ -302,7 +309,7 @@ class BehaviorDetectionSystem:
             if self.pose_model is None:
                 raise ValueError("Pose model failed to load.")
 
-            self.helmet_model = YOLO('helmet_25.pt').to('cuda')
+            self.helmet_model = YOLO('2_hemletYoloV8_100epochs.pt').to('cuda')
             if self.helmet_model is None:
                 raise ValueError("Helmet model failed to load.")
 
@@ -459,20 +466,57 @@ class BehaviorDetectionSystem:
                         if box.cls == self.helmet_class_id and box.conf > self.OBJECT_HELMET_CONF_THRESHOLD:
                             detected_helmets_boxes.append(box.xyxy[0].cpu().numpy().astype(int))
             
-            # 3. Associate Helmets with Tracked Persons
+            # # 3. Associate Helmets with Tracked Persons
+            # for tracker in self.trackers.values():
+            #     tracker.has_helmet = False # Reset for current frame, assume no helmet
+            #     if not tracker.keypoints_history or self.helmet_class_id is None: continue
+
+            #     head_region = tracker.get_head_region()
+            #     if head_region:
+            #         for helmet_box in detected_helmets_boxes:
+            #             if self.iou(head_region, helmet_box) > self.HELMET_IOU_THRESHOLD:
+            #                 tracker.has_helmet = True
+            #                 break 
+            
+            # # 4. Draw annotations and check alerts
+            # annotated_frame = self.draw_annotations_and_handle_alerts(frame.copy())
+
+            # with self.detection_lock:
+            #     self.latest_frame = annotated_frame.copy()
+
+            # 3. Associate Helmets with Tracked Persons and DEBUG DRAWING
+            # 先把所有检测到的安全帽画出来，不管它有没有匹配上人
+            # 用一种颜色，比如 蓝色
+            for helmet_box in detected_helmets_boxes:
+                x1, y1, x2, y2 = helmet_box
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2) # 蓝色 BGR
+                cv2.putText(frame, "Helmet?", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+
             for tracker in self.trackers.values():
                 tracker.has_helmet = False # Reset for current frame, assume no helmet
                 if not tracker.keypoints_history or self.helmet_class_id is None: continue
 
                 head_region = tracker.get_head_region()
                 if head_region:
+                    # 把估算的头部区域也画出来
+                    # 用另一种颜色，比如 黄色
+                    hx1, hy1, hx2, hy2 = head_region
+                    cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (0, 255, 255), 2) # 黄色 BGR
+                    cv2.putText(frame, f"P-{tracker.id} Head?", (hx1, hy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                    
                     for helmet_box in detected_helmets_boxes:
-                        if self.iou(head_region, helmet_box) > self.HELMET_IOU_THRESHOLD:
+                        iou_score = self.iou(head_region, helmet_box)
+                        # 在头顶上显示IoU分数，方便调试
+                        cv2.putText(frame, f"IoU:{iou_score:.2f}", (hx1, hy1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+                        if iou_score > self.HELMET_IOU_THRESHOLD:
                             tracker.has_helmet = True
-                            break 
-            
+                            break
+
             # 4. Draw annotations and check alerts
-            annotated_frame = self.draw_annotations_and_handle_alerts(frame.copy())
+            # 注意，这里我们传入的是修改过的 frame，而不是 frame.copy()
+            annotated_frame = self.draw_annotations_and_handle_alerts(frame) 
 
             with self.detection_lock:
                 self.latest_frame = annotated_frame.copy()
@@ -892,5 +936,5 @@ if __name__ == "__main__":
 # System Control web
 # Running on http://172.30.32.231:5000/?key=610
 
-# normal User
+# Normal User
 # Running on http://172.30.32.231:5000
