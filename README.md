@@ -28,4 +28,4 @@
     -   `BehaviorDetectionSystem` 类顶部的 `CONFIGURATION` 区域是核心参数区，可调整检测灵敏度、录制设置等。
     -   `PersonTracker` 类顶部的常量区负责单个追踪目标的行为判断阈值。
     -   `__main__` 部分可以修改默认视频源和Web服务器的IP/端口。
--   **运行**: 直接运行此Python文件即可启动整个系统。
+-   **运行**: 直接运行app.py文件即可启动整个系统。
