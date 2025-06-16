@@ -82,6 +82,8 @@ class PersonTracker:
     FALL_ASPECT_RATIO_THRESHOLD = 1.8  # 摔倒判断：人的边界框 宽度/高度 > 1.8 就算摔倒 
     FALL_HIP_SHOULDER_TOLERANCE_PX = 10
     FALL_HIP_ABOVE_SHOULDER_FACTOR = 0.2 # Hips need to be this factor of body_height above shoulders
+    STATE_CONFIRM_FRAMES = 3 # 状态需要连续3帧确认才算生效
+    STATE_DISAPPEAR_FRAMES = 5 # 状态在5帧内没被再次确认，就认为消失
 
     def __init__(self, person_id, keypoints):
         # 当第一次发现一个人时，会创建这个对象
@@ -95,10 +97,39 @@ class PersonTracker:
         self.no_helmet_alert_sent = False  # 针对没戴安全帽
         self.last_alert_time = 0 # Generic last alert time for this tracker (not currently used by can_send_alert which is global)
         self.keypoints_history.append(keypoints) # 把第一次发现他的关键点存起来
-        self.has_helmet = True # Assume has helmet initially, detection will update this
         self.bbox = None # Store person's bounding box [x1, y1, x2, y2] from pose model
+        self.updated_in_current_frame = True # 新创建的追踪器，认为是更新过的
+        self.has_helmet = False # 这是最终的、平滑后的状态
+        self._no_helmet_counter = 0
+        self._has_helmet_counter = 0
+
+    def update_helmet_status(self, detected_helmet_this_frame):
+        """用这个新函数来更新安全帽状态，取代简单的 self.has_helmet = ..."""
+        
+        if detected_helmet_this_frame:
+            self._has_helmet_counter += 1
+            self._no_helmet_counter = 0 # 重置对立状态的计数器
+        else:
+            self._no_helmet_counter += 1
+            self._has_helmet_counter = 0
+
+        # 根据计数器更新最终状态
+        if self._has_helmet_counter >= self.STATE_CONFIRM_FRAMES:
+            # 如果连续N帧检测到帽子，就确认“已佩戴”状态
+            if not self.has_helmet: # 只有在状态改变时才打印日志，避免刷屏
+                print(f"Tracker {self.id}: Confirmed HAS HELMET.")
+            self.has_helmet = True
+            
+        elif self._no_helmet_counter >= self.STATE_DISAPPEAR_FRAMES:
+            # 如果连续N帧都未检测到帽子，就确认“未佩戴”状态
+            if self.has_helmet:
+                print(f"Tracker {self.id}: Confirmed NO HELMET.")
+            self.has_helmet = False
+            # 重置 no_helmet_alert_sent，允许再次报警
+            self.no_helmet_alert_sent = False
 
     def update(self, keypoints, bbox=None):
+        self.updated_in_current_frame = True # 只要调用update，就说明它在当前帧被更新了
         self.keypoints_history.append(keypoints)
         if bbox is not None:
             self.bbox = bbox
@@ -202,7 +233,7 @@ class PersonTracker:
         head_indices = [0, 1, 2, 3, 4]
         visible_head_kpts = []
         for i in head_indices:
-            if len(keypoints) > i and keypoints[i][2] > 0.3: # Confidence for head keypoints
+            if len(keypoints) > i and keypoints[i][2] > 0.25: # Confidence for head keypoints
                 visible_head_kpts.append(keypoints[i][:2])
         
         if not visible_head_kpts:
@@ -226,6 +257,14 @@ class PersonTracker:
         
         width = max_x - min_x
         height = max_y - min_y # 我们现在需要 height 来计算垂直中心
+
+        # --- 新增的合理性检查 ---
+        # 如果检测到的面部宽度太小或太大，就认为这是个无效检测，直接返回None
+        # 你需要根据你的视频分辨率和拍摄距离调整这两个值
+        MIN_FACE_WIDTH_PX = 10 
+        MAX_FACE_WIDTH_PX = 300 
+        if not (MIN_FACE_WIDTH_PX < width < MAX_FACE_WIDTH_PX):
+            return None # 返回None，外层循环就不会绘制这个框了
 
         # --- 修改 center_y 的定义 ---
         center_x = min_x + width / 2
@@ -252,14 +291,14 @@ class PersonTracker:
 # --- BehaviorDetectionSystem Class ---
 class BehaviorDetectionSystem:
     # --- Configuration Constants ---
-    HELMET_IOU_THRESHOLD = 0.6
+    HELMET_IOU_THRESHOLD = 0.3
     ALERT_COOLDOWN_SECONDS = 60 # Cooldown per person per alert type
     
     TRACKER_DISAPPEAR_SECONDS_NO_MATCH = 10 # If no match for this long, tracker is removed
     TRACKER_MATCH_MAX_DISTANCE_PX = 150 # Max distance (pixels) for matching detection to tracker
 
-    POSE_PERSON_CONF_THRESHOLD = 0.6
-    OBJECT_HELMET_CONF_THRESHOLD = 0.3
+    POSE_PERSON_CONF_THRESHOLD = 0.7
+    OBJECT_HELMET_CONF_THRESHOLD = 0.2
     
     RECORDING_BUFFER_MAXLEN = 300 # Frames (e.g., 60s at 5fps, 10s at 30fps)每秒录制 5 帧（即 5fps），那么 300 帧就是 60 秒
     RECORDING_VIDEO_FPS = 5.0 # Target FPS for saved alert videos设置保存的视频的目标帧率（Frames Per Second），即每秒录制多少帧。
@@ -404,6 +443,12 @@ class BehaviorDetectionSystem:
         return interArea / denominator if denominator > 0 else 0.0
 
     def detection_loop(self):
+        # --- 智能跳帧的配置只对非视频文件生效 ---
+        if not self.is_video_file:
+            TARGET_FPS = 10  # 目标FPS，可以根据你的摄像头调整
+            FRAME_INTERVAL = 1.0 / TARGET_FPS
+            last_process_time = 0
+
         while self.running:
             if not self.cap or not self.cap.isOpened():
                 self.add_log_message("[WARNING] Video capture is not open. Attempting to reconnect...")
@@ -425,23 +470,57 @@ class BehaviorDetectionSystem:
                     self.add_log_message("[INFO] Reconnected to video source.")
                     self.stats["detection_status"] = "Running"
 
-            ret, frame = self.cap.read()
-            if not ret:
-                if self.is_video_file:
+            # --- 根据视频源类型，选择不同的帧读取和控制策略 ---
+            
+            if self.is_video_file:
+                # --- 策略A：处理视频文件 ---
+                ret, frame = self.cap.read()
+                if not ret:
                     self.add_log_message("[INFO] Video file ended. Looping.")
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
-                else: # Stream error
+            else:
+                # --- 策略B：处理实时流 (摄像头) ---
+                ret = self.cap.grab()
+                if not ret:
                     self.add_log_message("[WARNING] Frame not received from stream. Pausing briefly.")
-                    time.sleep(0.5) # Longer pause for stream errors
+                    time.sleep(0.5)
                     continue
 
+                current_time = time.time()
+                if current_time - last_process_time < FRAME_INTERVAL:
+                    continue # 时间没到，跳过
+                
+                last_process_time = current_time
+                ret, frame = self.cap.retrieve()
+                if not ret:
+                    continue
+            
+            # --- 从这里开始，是所有视频源共用的处理逻辑 ---
+            
+            # 1. 拷贝帧到录制缓冲区 (如果需要)
             frame_copy_for_buffer = frame.copy()
             self.recording_buffer.append((time.time(), frame_copy_for_buffer))
 
-            # 1. Pose Detection (this finds people and their keypoints)
+            # 2. AI模型推理
             pose_results = self.pose_model(frame, verbose=False, conf=self.POSE_PERSON_CONF_THRESHOLD)
             
+            # --- 新增步骤 A: 重置所有追踪器的更新状态 ---
+            for tracker in self.trackers.values():
+                tracker.updated_in_current_frame = False
+                # 假设我们已经通过IoU计算出了当前帧的检测结果
+                detected_this_frame = False 
+                head_region = tracker.get_head_region()
+                if head_region:
+                    for helmet_box in detected_helmets_boxes:
+                        if self.iou(head_region, helmet_box) > self.HELMET_IOU_THRESHOLD:
+                            detected_this_frame = True
+                            break
+                
+                # 调用新的平滑函数来更新状态，而不是直接赋值
+                tracker.update_helmet_status(detected_this_frame)
+
+
             current_person_detections_for_tracking = []
             for r in pose_results:
                 if r.keypoints is not None and r.boxes is not None:
@@ -494,6 +573,11 @@ class BehaviorDetectionSystem:
 
 
             for tracker in self.trackers.values():
+
+                # --- 新增步骤 B: 只为当前帧更新过的追踪器执行后续操作 ---
+                if not tracker.updated_in_current_frame:
+                    continue # 如果这个追踪器是“过时的”，就直接跳过
+
                 tracker.has_helmet = False # Reset for current frame, assume no helmet
                 if not tracker.keypoints_history or self.helmet_class_id is None: continue
 
@@ -520,6 +604,12 @@ class BehaviorDetectionSystem:
 
             with self.detection_lock:
                 self.latest_frame = annotated_frame.copy()
+
+        # 在循环的最后，可以加一个 waitKey，特别是对于视频文件，可以给窗口一个响应机会
+        # 这个对于通过Flask等Web方式推流不是必须的，但对于本地显示窗口有好处
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'): # 允许按q退出
+                self.running = False
 
         if self.cap and self.cap.isOpened():
             self.cap.release()
