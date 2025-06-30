@@ -1,401 +1,365 @@
 from flask import Flask, render_template, Response, request, jsonify
+import threading
+import time
 import cv2
 import numpy as np
-import time
-import threading
-from datetime import datetime, timedelta
-import os
-import json
-from collections import defaultdict, deque
-import queue # Keep queue for alerts if needed, or switch to simple list
-import math
-from PIL import Image # Will be used by Flask if sending PIL images, but cv2.imencode is better for MJPEG
-from opcua import ua, Server  # 导入OPC UA服务器功能
-import threading             # 我们需要线程来在后台运行服务器
-
+from PIL import Image 
 try:
     from ultralytics import YOLO
 except ImportError:
-    print("Please install ultralytics: pip install ultralytics")
+    print("Error: 'ultralytics' library not found. Please install it via 'pip install ultralytics'.")
     exit(1)
 
-# --- OPC UA Setup ---
+from opcua import ua, Server
 
-# 创建一个全局变量来持有我们的OPC UA服务器和警报变量 ---
+import os
+import json
+import math
+from collections import deque
+from datetime import datetime
+
 opcua_server = None
 opcua_fall_variable = None
 opcua_helmet_variable = None
+OPCUA_SERVER_ENDPOINT = "opc.tcp://172.30.32.231:4841/SafetyServer/"
+OPCUA_NAMESPACE_URI = "http://mycompany.com/safety_alerts"
 
-# --- 3. 创建一个函数来启动OPC UA服务器 ---
 def start_opcua_server():
-    """这个函数会在一个独立的线程中运行，负责启动和维护OPC UA服务器"""
+    """
+    此函数在一个独立的后台线程中启动并运行OPC UA服务器。
+    它负责初始化服务器、创建数据节点，并持续运行以等待客户端连接和数据更新。
+    """
     global opcua_server, opcua_fall_variable, opcua_helmet_variable
     
-    # --- 服务器配置 ---
-    # 创建服务器实例
-    opcua_server = Server()
-    
-    # 设置服务器地址。'0.0.0.0'表示网络上任何电脑都可以访问。4841是OPC UA的默认端口。
-    opcua_server.set_endpoint("opc.tcp://172.30.32.231:4841/SafetyServer/")
-
-    # 设置一个服务器名
-    opcua_server.set_server_name("Simple Safety Alert Server")
-    
-    # 注册一个命名空间，这就像给你的变量创建一个专属文件夹
-    uri = "http://mycompany.com/safety_alerts"
-    idx = opcua_server.register_namespace(uri)
-
-    # --- 创建我们要发送的变量 ---
-    # 在 'Objects' 节点下创建一个叫 'MyAlerts' 的对象
-    my_alerts_obj = opcua_server.nodes.objects.add_object(idx, "MyAlerts")
-    
-    # 在 'MyAlerts' 对象下，创建我们唯一的警报变量 'LatestAlert'
-    # 初始值为 0 (表示 '无警报')
-    # 必须设置这个变量为可写，这样我们才能修改它的值
-    opcua_fall_variable = my_alerts_obj.add_variable(idx, "FallStatus", 0)
-    opcua_fall_variable.set_writable()
-
-    opcua_helmet_variable = my_alerts_obj.add_variable(idx, "NoHelmetStatus", 0)
-    opcua_helmet_variable.set_writable()
-
     try:
-        # --- 启动服务器 ---
+        opcua_server = Server()
+        
+        opcua_server.set_endpoint(OPCUA_SERVER_ENDPOINT)
+        opcua_server.set_server_name("Safety Alert OPC UA Server")
+        
+        idx = opcua_server.register_namespace(OPCUA_NAMESPACE_URI)
+
+        alerts_obj = opcua_server.nodes.objects.add_object(idx, "SafetyAlerts")
+        
+        opcua_fall_variable = alerts_obj.add_variable(idx, "FallStatus", 0)
+        opcua_fall_variable.set_writable()
+
+        opcua_helmet_variable = alerts_obj.add_variable(idx, "NoHelmetStatus", 0)
+        opcua_helmet_variable.set_writable()
+
         opcua_server.start()
-        print("✅ OPC UA Server started at opc.tcp://172.30.32.231:4841/SafetyServer/")
-        # 让这个线程一直运行，直到主程序退出
+        print(f"✅ OPC UA server started successfully on: {OPCUA_SERVER_ENDPOINT}")
+        
         while True:
             time.sleep(1)
             
     except Exception as e:
-        print(f"Failed to start OPC UA Server: {e}")
+        print(f"❌ Failed to start OPC UA server: {e}")
     finally:
-        # 如果循环退出（虽然正常情况不会），就关闭服务器
         if opcua_server:
             opcua_server.stop()
-            print("OPC UA Server stopped.")
+            print("The OPC UA server is stopped.")
 
-# --- PersonTracker Class ---
 class PersonTracker:
-    KEYPOINTS_HISTORY_MAXLEN = 30 # 只保留最近30帧的关键点历史，防止内存无限增长
-    MOVEMENT_THRESHOLD_PIXELS = 10  # 关键点平均移动超过10个像素，才算“显著移动”
-    STATIONARY_DURATION_SECONDS = 180  # 3分钟（180秒）没有显著移动，就算“静止”
-    FALL_ASPECT_RATIO_THRESHOLD = 1.8  # 摔倒判断：人的边界框 宽度/高度 > 1.8 就算摔倒 
-    FALL_HIP_SHOULDER_TOLERANCE_PX = 10
-    FALL_HIP_ABOVE_SHOULDER_FACTOR = 0.2 # Hips need to be this factor of body_height above shoulders
-    STATE_CONFIRM_FRAMES = 3 # 状态需要连续3帧确认才算生效
-    STATE_DISAPPEAR_FRAMES = 5 # 状态在5帧内没被再次确认，就认为消失
+    """
+    此类负责追踪单个人的状态和行为。
+    每个人被检测到时，都会创建一个此类的实例，并赋予一个唯一的ID。
+    它记录了人的关键点历史、运动状态、是否摔倒、是否佩戴安全帽等信息。
+    """
 
-    def __init__(self, person_id, keypoints):
-        # 当第一次发现一个人时，会创建这个对象
-        self.id = person_id  # 给这个人一个唯一的ID
-        self.keypoints_history = deque(maxlen=self.KEYPOINTS_HISTORY_MAXLEN)  # deque列表，当满了之后，再加新的会自动挤掉最旧的
-        self.last_movement_time = time.time()  # 记录他最后一次移动的时间
-        self.is_fallen = False  # 他现在摔倒了吗？ (状态)
-        self.is_stationary = False  # 他现在静止吗？ (状态)
-        self.fall_alert_sent = False  # 已经为这次摔倒发过警报了吗？ (防止重复报警)
-        self.stationary_alert_sent = False  # 针对静止
-        self.no_helmet_alert_sent = False  # 针对没戴安全帽
-        self.last_alert_time = 0 # Generic last alert time for this tracker (not currently used by can_send_alert which is global)
-        self.keypoints_history.append(keypoints) # 把第一次发现他的关键点存起来
-        self.bbox = None # Store person's bounding box [x1, y1, x2, y2] from pose model
-        self.updated_in_current_frame = True # 新创建的追踪器，认为是更新过的
-        self.has_helmet = False # 这是最终的、平滑后的状态
-        self._no_helmet_counter = 0
-        self._has_helmet_counter = 0
+    KEYPOINTS_HISTORY_MAXLEN = 30     # 保留最近30帧的关键点历史，用于分析和防止内存溢出。
+    MOVEMENT_THRESHOLD_PIXELS = 10    # 关键点平均移动超过此像素值，才被认为是“有效移动”。
+    STATIONARY_DURATION_SECONDS = 180 # 超过此时间（3分钟）没有有效移动，则判定为“静止”。
 
-    def update_helmet_status(self, detected_helmet_this_frame):
-        """用这个新函数来更新安全帽状态，取代简单的 self.has_helmet = ..."""
+    FALL_ASPECT_RATIO_THRESHOLD = 1.8 # 边界框的 宽度/高度 > 1.8，则可能摔倒。
+    FALL_HIP_SHOULDER_TOLERANCE_PX = 10 # 允许臀部比肩膀低10个像素，仍视为直立。
+    
+    STATE_CONFIRM_FRAMES = 3          # 状态需要连续N帧被确认才算生效（例如，连续3帧检测到安全帽才确认佩戴）。
+    STATE_DISAPPEAR_FRAMES = 3        # 状态连续N帧未被确认，则认为消失（例如，连续5帧未检测到安全帽才确认未佩戴）。
+
+    def __init__(self, person_id, keypoints, bbox):
+        """
+        初始化一个新的个人追踪器。
+        - person_id: 分配的唯一ID。
+        - keypoints: 第一次检测到的人体关键点数据。
+        - bbox: 第一次检测到的人体边界框。
+        """
+        self.id = person_id
+        self.keypoints_history = deque(maxlen=self.KEYPOINTS_HISTORY_MAXLEN) # 使用deque自动管理历史记录长度
+        self.bbox = bbox  # 当前人的边界框 [x1, y1, x2, y2]
+
+        self.is_fallen = False
+        self.is_stationary = False
+        self.has_helmet = True  # 默认为True，直到连续多帧检测不到才变为False
         
+        self.fall_alert_sent = False
+        self.stationary_alert_sent = False
+        self.no_helmet_alert_sent = False
+
+        self.last_update_time = time.time() # 记录此追踪器最后一次在帧中被更新的时间
+        self.last_movement_time = time.time()
+        self._no_helmet_counter = 0 # 内部计数器：连续未检测到安全帽的帧数
+        self._has_helmet_counter = 0 # 内部计数器：连续检测到安全帽的帧数
+
+        self.keypoints_history.append(keypoints)
+
+    def update(self, keypoints, bbox):
+        self.last_update_time = time.time()
+        self.keypoints_history.append(keypoints)
+        self.bbox = bbox
+
+        if len(self.keypoints_history) >= 2:
+            movement = self._calculate_movement()
+            if movement > self.MOVEMENT_THRESHOLD_PIXELS:
+                self.last_movement_time = time.time()
+                self.is_stationary = False
+                self.stationary_alert_sent = False
+            else:
+                if time.time() - self.last_movement_time > self.STATIONARY_DURATION_SECONDS:
+                    self.is_stationary = True
+        
+        fall_detected_this_frame = self._detect_fall()
+        if fall_detected_this_frame and not self.is_fallen:
+            self.is_fallen = True # 状态从未摔倒变为摔倒
+        elif not fall_detected_this_frame and self.is_fallen:
+            self.is_fallen = False # 状态从摔倒恢复
+            self.fall_alert_sent = False # 允许下一次摔倒时再次报警
+
+    def update_helmet_status(self, detected_helmet_this_frame: bool):
         if detected_helmet_this_frame:
             self._has_helmet_counter += 1
-            self._no_helmet_counter = 0 # 重置对立状态的计数器
+            self._no_helmet_counter = 0  # 重置反向状态的计数器
         else:
             self._no_helmet_counter += 1
             self._has_helmet_counter = 0
 
-        # 根据计数器更新最终状态
         if self._has_helmet_counter >= self.STATE_CONFIRM_FRAMES:
-            # 如果连续N帧检测到帽子，就确认“已佩戴”状态
-            if not self.has_helmet: # 只有在状态改变时才打印日志，避免刷屏
-                print(f"Tracker {self.id}: Confirmed HAS HELMET.")
+            if not self.has_helmet:
+                print(f"[INFORMATION] Tracker {self.id}: Status confirmation -> Safety helmet worn")
             self.has_helmet = True
+            self.no_helmet_alert_sent = False
             
         elif self._no_helmet_counter >= self.STATE_DISAPPEAR_FRAMES:
-            # 如果连续N帧都未检测到帽子，就确认“未佩戴”状态
             if self.has_helmet:
-                print(f"Tracker {self.id}: Confirmed NO HELMET.")
+                print(f"[INFORMATION] Tracker {self.id}: Status confirmation -> Not wearing a helmet")
             self.has_helmet = False
-            # 重置 no_helmet_alert_sent，允许再次报警
-            self.no_helmet_alert_sent = False
 
-    def update(self, keypoints, bbox=None):
-        self.updated_in_current_frame = True # 只要调用update，就说明它在当前帧被更新了
-        self.keypoints_history.append(keypoints)
-        if bbox is not None:
-            self.bbox = bbox
-
-        if len(self.keypoints_history) >= 2:
-            movement = self.calculate_movement()
-            if movement > self.MOVEMENT_THRESHOLD_PIXELS:
-                self.last_movement_time = time.time()
-                if self.is_stationary: self.stationary_alert_sent = False # Reset alert if moved
-                if self.is_fallen: self.fall_alert_sent = False # Reset alert if moved (and not fallen anymore)
-                # No_helmet alert is reset when helmet is detected, not purely on movement.
-                self.is_stationary = False
-                self.is_fallen = False # Fall state should be re-evaluated each frame
-            else:
-                if time.time() - self.last_movement_time > self.STATIONARY_DURATION_SECONDS:
-                    self.is_stationary = True
-
-        fall_detected = self.detect_fall()
-        if fall_detected and not self.is_fallen: # New fall event
-            self.is_fallen = True
-            # self.fall_alert_sent = False # Alert will be triggered by main loop if not sent
-        elif not fall_detected and self.is_fallen: # Was fallen, but not anymore
-            self.is_fallen = False
-            self.fall_alert_sent = False # Allow re-alerting if they fall again later
-
-    def calculate_movement(self):
-        if len(self.keypoints_history) < 2: return 0
-        current_kpts_arr = self.keypoints_history[-1]
-        previous_kpts_arr = self.keypoints_history[-2]
+    def _calculate_movement(self) -> float:
+        if len(self.keypoints_history) < 2:
+            return 0.0
         
-        # Ensure keypoints are numpy arrays for easier processing
-        current = np.array(current_kpts_arr)
-        previous = np.array(previous_kpts_arr)
-
-        total_movement = 0
-        valid_points = 0
+        current_kpts = np.array(self.keypoints_history[-1])
+        previous_kpts = np.array(self.keypoints_history[-2])
         
-        # Keypoints are expected to be (N, 3) where N is num_keypoints, and columns are x, y, conf
-        min_len = min(len(current), len(previous))
-        for i in range(min_len):
-            if (current.shape[1] > 2 and previous.shape[1] > 2 and # Check if conf is present
-                current[i][2] > 0.5 and previous[i][2] > 0.5): # Confidence threshold
-                dx = current[i][0] - previous[i][0]
-                dy = current[i][1] - previous[i][1]
-                movement = math.sqrt(dx*dx + dy*dy)
-                total_movement += movement
-                valid_points += 1
-        return total_movement / max(valid_points, 1)
+        valid_mask = (current_kpts[:, 2] > 0.5) & (previous_kpts[:, 2] > 0.5)
+        
+        if not np.any(valid_mask):
+            return 0.0
 
-    def detect_fall(self):
+        distances = np.linalg.norm(current_kpts[valid_mask, :2] - previous_kpts[valid_mask, :2], axis=1)
+        
+        return np.mean(distances)
+
+    def _detect_fall(self) -> bool:
         if not self.keypoints_history: return False
-        keypoints = np.array(self.keypoints_history[-1]) # Ensure numpy array
-
-        # Keypoint indices for COCO format
-        nose_idx, l_shoulder_idx, r_shoulder_idx, l_hip_idx, r_hip_idx = 0, 5, 6, 11, 12
         
-        # Helper to get keypoint if valid
+        kpts = np.array(self.keypoints_history[-1])
+        
+        l_shoulder_idx, r_shoulder_idx, l_hip_idx, r_hip_idx = 5, 6, 11, 12
+        
         def get_kpt(idx):
-            if len(keypoints) > idx and keypoints[idx][2] > 0.5: # Check confidence
-                return keypoints[idx]
-            return None
+            return kpts[idx][:2] if len(kpts) > idx and kpts[idx][2] > 0.5 else None
 
-        # nose = get_kpt(nose_idx) # Nose not directly used in this fall logic
-        left_shoulder = get_kpt(l_shoulder_idx)
-        right_shoulder = get_kpt(r_shoulder_idx)
-        left_hip = get_kpt(l_hip_idx)
-        right_hip = get_kpt(r_hip_idx)
+        left_shoulder, right_shoulder = get_kpt(l_shoulder_idx), get_kpt(r_shoulder_idx)
+        left_hip, right_hip = get_kpt(l_hip_idx), get_kpt(r_hip_idx)
 
-        if (left_shoulder is not None and right_shoulder is not None and 
-            left_hip is not None and right_hip is not None):
-            
+        if all(p is not None for p in [left_shoulder, right_shoulder, left_hip, right_hip]):
             shoulder_center_y = (left_shoulder[1] + right_shoulder[1]) / 2
             hip_center_y = (left_hip[1] + right_hip[1]) / 2
-            
-            # Check if person is roughly horizontal (hips not significantly lower than shoulders)
-            if hip_center_y < shoulder_center_y + self.FALL_HIP_SHOULDER_TOLERANCE_PX:
-                body_width = abs(left_shoulder[0] - right_shoulder[0])
-                # Use a small epsilon to avoid division by zero if body_height is tiny
-                body_height = abs(shoulder_center_y - hip_center_y) + 1e-6 
-                
-                aspect_ratio = body_width / body_height
-                if aspect_ratio > self.FALL_ASPECT_RATIO_THRESHOLD:
+
+            body_width = abs(left_shoulder[0] - right_shoulder[0])
+            body_height = abs(shoulder_center_y - hip_center_y) + 1e-6
+            aspect_ratio = body_width / body_height
+
+            if aspect_ratio > self.FALL_ASPECT_RATIO_THRESHOLD:
                     return True
             
-            # More lenient check: if hips are significantly above shoulders (e.g. headstand like fall)
-            # This requires careful tuning, as it might be overly sensitive.
-            # Using a factor of estimated body height (shoulder to hip) for this check.
-            estimated_body_segment_height = abs(shoulder_center_y - hip_center_y)
-            if estimated_body_segment_height > 0 and \
-               hip_center_y < shoulder_center_y - (estimated_body_segment_height * self.FALL_HIP_ABOVE_SHOULDER_FACTOR):
-                return True
+            # if hip_center_y < shoulder_center_y + self.FALL_HIP_SHOULDER_TOLERANCE_PX:
+            #     body_width = abs(left_shoulder[0] - right_shoulder[0])
+            #     body_height = abs(shoulder_center_y - hip_center_y) + 1e-6
+                
+            #     aspect_ratio = body_width / body_height
+            #     if aspect_ratio > self.FALL_ASPECT_RATIO_THRESHOLD:
+            #         return True
+                    
         return False
 
-    def get_head_region(self):
-        """Estimates head region based on keypoints or bbox."""
+    def get_head_region(self) -> tuple or None:
         if not self.keypoints_history: return None
-        
-        keypoints = np.array(self.keypoints_history[-1])
-        
-        # Keypoints indices: 0:Nose, 1:L_Eye, 2:R_Eye, 3:L_Ear, 4:R_Ear
+        kpts = np.array(self.keypoints_history[-1])
+
         head_indices = [0, 1, 2, 3, 4]
-        visible_head_kpts = []
-        for i in head_indices:
-            if len(keypoints) > i and keypoints[i][2] > 0.25: # Confidence for head keypoints
-                visible_head_kpts.append(keypoints[i][:2])
+        visible_head_kpts = [kpts[i][:2] for i in head_indices if len(kpts) > i and kpts[i][2] > 0.4]
         
-        if not visible_head_kpts:
-            # Fallback logic remains the same...
-            if self.bbox is not None:
-                x1, y1, x2, y2 = map(int, self.bbox[:4])
-                head_height_ratio = 0.25 
-                head_y1 = y1
-                head_y2 = y1 + (y2 - y1) * head_height_ratio
-                head_x1 = x1 + (x2 - x1) * 0.1
-                head_x2 = x2 - (x2 - x1) * 0.1
-                return (int(head_x1), int(head_y1), int(head_x2), int(head_y2))
-            return None
+        if len(visible_head_kpts) >= 2: # 至少需要两个点才能估算
+            visible_head_kpts_np = np.array(visible_head_kpts)
+            min_x, min_y = np.min(visible_head_kpts_np, axis=0)
+            max_x, max_y = np.max(visible_head_kpts_np, axis=0)
 
-        visible_head_kpts_np = np.array(visible_head_kpts)
-        min_x, min_y = np.min(visible_head_kpts_np, axis=0)
-        max_x, max_y = np.max(visible_head_kpts_np, axis=0)
+            face_width = max_x - min_x
+            face_height = max_y - min_y
 
-        # --- 核心修改区域 ---
-        # 旧的逻辑问题很大，我们用新的逻辑替换它
+            if 15 < face_width < 250 and 15 < face_height < 250:
+                center_x = min_x + face_width / 2
+                center_y = min_y + face_height / 2
+                base_size = max(face_width, face_height)
+                box_width = base_size * 1.2 
+                box_height = base_size * 1.5
+                hx1 = int(center_x - box_width / 2)
+                hy1 = int(center_y - box_height * 0.65) # 65%在上方
+                hx2 = int(center_x + box_width / 2)
+                hy2 = int(center_y + box_height * 0.35) # 35%在下方
+                return max(0, hx1), max(0, hy1), hx2, hy2
+
+            # center_x = min_x + face_width / 2
+            # center_y = min_y + face_height / 2
+
+            # box_width = face_width * 1.5
+            # box_height = face_width * 1.8 # 头盔是垂直较长的，这个比例是关键
+
+            # hx1 = int(center_x - box_width / 2)
+            # hy1 = int(center_y - box_height * 0.7)  # 从面部中心向上延伸更多
+            # hx2 = int(center_x + box_width / 2)
+            # hy2 = int(center_y + box_height * 0.3)  # 向下延伸较少
+
+            # return max(0, hx1), max(0, hy1), hx2, hy2
+
+        if self.bbox is not None:
+            x1, y1, x2, y2 = self.bbox
+            person_height = y2 - y1
+
+            head_height = person_height * 0.30 
+
+            person_width = x2 - x1
+            head_width = person_width * 0.8
+
+            head_center_x = x1 + person_width / 2
+            
+            head_x1 = int(head_center_x - head_width / 2)
+            head_y1 = int(y1) # 头部从身体的顶端开始
+            head_x2 = int(head_center_x + head_width / 2)
+            head_y2 = int(y1 + head_height)
+            
+            return head_x1, head_y1, head_x2, head_y2
         
-        width = max_x - min_x
-        height = max_y - min_y # 我们现在需要 height 来计算垂直中心
+        # if self.bbox is not None:
+        #     x1, y1, x2, y2 = self.bbox
+        #     head_height = (y2 - y1) * 0.25 # 假设头部占身高的25%
+        #     head_width_margin = (x2 - x1) * 0.15 # 左右留出一些边距
 
-        # --- 新增的合理性检查 ---
-        # 如果检测到的面部宽度太小或太大，就认为这是个无效检测，直接返回None
-        # 你需要根据你的视频分辨率和拍摄距离调整这两个值
-        MIN_FACE_WIDTH_PX = 10 
-        MAX_FACE_WIDTH_PX = 300 
-        if not (MIN_FACE_WIDTH_PX < width < MAX_FACE_WIDTH_PX):
-            return None # 返回None，外层循环就不会绘制这个框了
+        #     head_x1 = int(x1 + head_width_margin)
+        #     head_y1 = int(y1)
+        #     head_x2 = int(x2 - head_width_margin)
+        #     head_y2 = int(y1 + head_height)
+        #     return head_x1, head_y1, head_x2, head_y2
 
-        # --- 修改 center_y 的定义 ---
-        center_x = min_x + width / 2
-        center_y = min_y + height / 2
-        
-        # 估算头部+安全帽的尺寸
-        # 宽度可以稍微放大一点
-        box_width = width * 1.4 
-        # 高度应该是宽度的某个倍数，因为头+安全帽是比较高的
-        box_height = width * 1.8 # <--- 这是关键参数，可以调整
+        return None
 
-        # 计算新的坐标
-        # 向上扩展大部分，向下扩展一小部分
-        hx1 = int(center_x - box_width / 2)
-        hy1 = int(center_y - box_height * 0.65) # 从眼睛中心向上扩展 65%
-        hy2 = int(center_y + box_height * 0.35) # 从眼睛中心向下扩展 35%
-        hx2 = int(center_x + box_width / 2)
-
-        # 确保坐标是正数
-        hx1, hy1 = max(0, hx1), max(0, hy1)
-
-        return (hx1, hy1, hx2, hy2)
-
-# --- BehaviorDetectionSystem Class ---
 class BehaviorDetectionSystem:
-    # --- Configuration Constants ---
-    HELMET_IOU_THRESHOLD = 0.3
-    ALERT_COOLDOWN_SECONDS = 60 # Cooldown per person per alert type
-    
-    TRACKER_DISAPPEAR_SECONDS_NO_MATCH = 10 # If no match for this long, tracker is removed
-    TRACKER_MATCH_MAX_DISTANCE_PX = 150 # Max distance (pixels) for matching detection to tracker
 
-    POSE_PERSON_CONF_THRESHOLD = 0.7
-    OBJECT_HELMET_CONF_THRESHOLD = 0.2
-    
-    RECORDING_BUFFER_MAXLEN = 300 # Frames (e.g., 60s at 5fps, 10s at 30fps)每秒录制 5 帧（即 5fps），那么 300 帧就是 60 秒
-    RECORDING_VIDEO_FPS = 5.0 # Target FPS for saved alert videos设置保存的视频的目标帧率（Frames Per Second），即每秒录制多少帧。
-    # --- End Configuration Constants ---
+    POSE_PERSON_CONF_THRESHOLD = 0.8    # 人体姿态检测的置信度阈值
+    HELMET_CONF_THRESHOLD = 0.6       # 安全帽检测的置信度阈值
+    HELMET_IOU_THRESHOLD = 0.3        # 头部区域与安全帽框的IoU（交并比）阈值，用于判断是否佩戴
 
-    def __init__(self, video_source="test_video.mp4"):
+    ALERT_COOLDOWN_SECONDS = 10       # 同一类型警报的冷却时间（秒），防止刷屏
+
+    TRACKER_MAX_DISAPPEAR_SECONDS = 5 # 追踪目标消失超过此时长，则移除追踪器
+    TRACKER_MAX_MATCH_DISTANCE_PX = 50 # 匹配新检测与旧追踪器的最大像素距离
+
+    RECORDING_BUFFER_FRAMES = 300     # 录制缓冲区大小（帧）。例如，10 FPS下可缓冲30秒
+    RECORDING_VIDEO_FPS = 10.0        # 保存的警报视频的帧率
+
+    MIN_PERSON_HEIGHT_PIXELS = 200 # 新增：人的边界框高度必须大于此像素值，才被视为在有效工作区内
+
+    def __init__(self, video_source):
         self.video_source = video_source
         self.pose_model = None
-        self.helmet_model = None ## <-- 修改/MODIFIED: 不再需要 object_model 和 person_model, 只需要 helmet_model
+        self.helmet_model = None
         self.cap = None
-        self.trackers = {}
-        self.next_id = 0
         self.running = False
-        self.latest_frame = None
-        self.detection_lock = threading.Lock() # Protects latest_frame, stats, alerts
 
-        self.alerts = deque(maxlen=100) # Increased maxlen for more log history
+        self.trackers = {} # 存储所有 PersonTracker 实例，格式: {id: tracker_object}
+        self.next_id = 0
+        self.latest_frame = None # 存储处理后的最新帧，用于Web流
+        self.detection_lock = threading.Lock() # 线程锁，保护共享数据（如latest_frame, stats, alerts）
+        self.recording_buffer = deque(maxlen=self.RECORDING_BUFFER_FRAMES) # 存储最近的帧用于警报录制
+
+        self.alerts = deque(maxlen=100) # 存储警报和系统日志
         self.stats = {
-            "people_count": 0, "fallen_count": 0,
-            "stationary_count": 0, "no_helmet_count": 0,
-            "model_status": "Not Loaded", "detection_status": "Stopped"
+            "people_count": 0, "fallen_count": 0, "stationary_count": 0, "no_helmet_count": 0,
+            "model_status": "Not loaded", "detection_status": "Stopped"
         }
-
-        self.is_video_file = self.check_if_video_file(video_source)
-        self.alert_cooldown_map = {} # {(person_id, alert_type): last_alert_timestamp}
+        self.alert_cooldown_map = {} # 记录警报冷却时间戳, 格式: {(person_id, alert_type): timestamp}
+        self.is_video_file = self._is_video_file_source()
 
         os.makedirs("alerts_data/recordings", exist_ok=True)
         os.makedirs("alerts_data/json", exist_ok=True)
-        self.recording_buffer = deque(maxlen=self.RECORDING_BUFFER_MAXLEN)
-        self.is_recording_alert_active = False # True if an alert video is currently being saved
-        self.an_alert_condition_exists = False # True if any person currently has an active alert state
 
-    def check_if_video_file(self, source):
+    def _is_video_file_source(self):
         try:
-            int(source)
-            return False # Webcam ID
+            int(self.video_source)
+            return False # 是数字，代表摄像头ID
         except ValueError:
-            video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']
-            return any(str(source).lower().endswith(ext) for ext in video_extensions)
+            # 检查文件扩展名
+            video_exts = ['.mp4', '.avi', '.mov', '.mkv', '.webm']
+            return any(str(self.video_source).lower().endswith(ext) for ext in video_exts)
 
     def load_models(self):
-        self.add_log_message("[SYSTEM] Attempting to load models...")
-        self.stats["model_status"] = "Loading..."
+        self._log_message("[System] Loading AI model...")
+        self.stats["model_status"] = "loading..."
         try:
-            # Load the models and check if they are initialized properly
             self.pose_model = YOLO('yolov8x-pose.pt').to('cuda')
-            if self.pose_model is None:
-                raise ValueError("Pose model failed to load.")
-
-            self.helmet_model = YOLO('2_hemletYoloV8_100epochs.pt').to('cuda')
-            if self.helmet_model is None:
-                raise ValueError("Helmet model failed to load.")
-
-            # Access class names from the models
-            self.helmet_class_id = next((k for k, v in self.helmet_model.names.items() if v.lower() == 'helmet'), None)
+            self.helmet_model = YOLO('best.pt').to('cuda')
             
+            self.helmet_class_id = next(
+                (k for k, v in self.helmet_model.names.items() if v.lower() == 'helmet'), None
+            )
             if self.helmet_class_id is None:
-                self.add_log_message("[WARNING] 'helmet' class not found in helmet_model.")
+                self._log_message("[WARNING] Class 'helmet' not found in helmet model. Helmet detection will not be available.")
             
-            self.add_log_message("[INFO] Models loaded successfully.")
+            self._log_message("[System] AI model loaded successfully.")
             self.stats["model_status"] = "Loaded"
             return True
         except Exception as e:
-            self.add_log_message(f"[ERROR] Failed to load models: {str(e)}")
-            self.stats["model_status"] = f"Error: {str(e)}"
-            self.pose_model = None
-            self.helmet_model = None
+            self._log_message(f"[ERROR] Failed to load model: {e}")
+            self.stats["model_status"] = "Loading failed"
+            self.pose_model = self.helmet_model = None
             return False
 
     def start_detection(self):
         if self.running:
-            self.add_log_message("[INFO] Detection already running.")
+            self._log_message("[INFORMATION] Test is already running.")
             return
 
-        if not self.pose_model or not self.helmet_model:
-            if not self.load_models():
-                self.stats["detection_status"] = "Stopped (Model Load Failed)"
-                return
+        if not self.pose_model and not self.load_models():
+            self.stats["detection_status"] = "Stopped (model loading failed)"
+            return
 
-        self.add_log_message(f"[INFO] Attempting to open video source: {self.video_source}")
+        # self._log_message(f"[INFORMATION] Opening video source: {self.video_source}")
+        self._log_message(f"[INFORMATION] Opening video source...")
         try:
-            capture_source = int(self.video_source) if str(self.video_source).isdigit() else self.video_source
-            self.cap = cv2.VideoCapture(capture_source, cv2.CAP_FFMPEG)
+            source = int(self.video_source) if str(self.video_source).isdigit() else self.video_source
+            self.cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
         except Exception as e:
-             self.add_log_message(f"[ERROR] OpenCV Error during VideoCapture init: {e}")
-             self.cap = None
+            self._log_message(f"[Error] Error initializing VideoCapture: {e}")
+            self.cap = None
 
         if not self.cap or not self.cap.isOpened():
-            self.add_log_message(f"[ERROR] Failed to open video source: {self.video_source}")
-            self.running = False
-            self.stats["detection_status"] = "Stopped (Source Error)"
+            # self._log_message(f"[Error] Unable to open video source: {self.video_source}")
+            self._log_message(f"[Error] Unable to open video source")
+            self.stats["detection_status"] = "Stopped (video source error)"
             return
 
-        self.is_video_file = self.check_if_video_file(self.video_source)
-        source_type = "Video File" if self.is_video_file else ("Webcam" if str(self.video_source).isdigit() else "Stream")
-        self.add_log_message(f"[INFO] Opened {source_type}: {self.video_source}")
-        
         self.running = True
         self.stats["detection_status"] = "Running"
         self.trackers.clear()
@@ -403,15 +367,13 @@ class BehaviorDetectionSystem:
         
         self.detection_thread = threading.Thread(target=self.detection_loop, daemon=True)
         self.detection_thread.start()
-        self.add_log_message("[INFO] Detection thread started.")
+        self._log_message("[INFORMATION] Detection thread started.")
 
     def stop_detection(self):
         self.running = False
         if hasattr(self, 'detection_thread') and self.detection_thread.is_alive():
-            self.add_log_message("[INFO] Waiting for detection thread to finish...")
-            self.detection_thread.join(timeout=5) # Increased timeout
-            if self.detection_thread.is_alive():
-                 self.add_log_message("[WARNING] Detection thread did not finish in time.")
+            self._log_message("[INFORMATION] Waiting for detection thread to end...")
+            self.detection_thread.join(timeout=5)
         
         with self.detection_lock:
             if self.cap:
@@ -420,608 +382,420 @@ class BehaviorDetectionSystem:
             self.latest_frame = None
         
         self.trackers.clear()
-        with self.detection_lock:
-            self.stats.update({
-                "people_count": 0, "fallen_count": 0,
-                "stationary_count": 0, "no_helmet_count": 0,
-                "detection_status": "Stopped"
-            })
-        self.add_log_message("[INFO] Detection stopped.")
-
-    def iou(self, boxA, boxB):
-        # (x1, y1, x2, y2)
-        xA = max(boxA[0], boxB[0])
-        yA = max(boxA[1], boxB[1])
-        xB = min(boxA[2], boxB[2])
-        yB = min(boxA[3], boxB[3])
-
-        interArea = max(0, xB - xA) * max(0, yB - yA)
-        boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-        boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-        
-        denominator = float(boxAArea + boxBArea - interArea)
-        return interArea / denominator if denominator > 0 else 0.0
+        self.stats.update({
+            "people_count": 0, "fallen_count": 0, "stationary_count": 0, "no_helmet_count": 0,
+            "detection_status": "Stopped"
+        })
+        self._log_message("[INFORMATION] Detection stopped.")
 
     def detection_loop(self):
-        # --- 智能跳帧的配置只对非视频文件生效 ---
-        if not self.is_video_file:
-            TARGET_FPS = 10  # 目标FPS，可以根据你的摄像头调整
-            FRAME_INTERVAL = 1.0 / TARGET_FPS
-            last_process_time = 0
+        TARGET_FPS = 10
+        FRAME_INTERVAL = 1.0 / TARGET_FPS
+        last_process_time = 0
 
         while self.running:
             if not self.cap or not self.cap.isOpened():
-                self.add_log_message("[WARNING] Video capture is not open. Attempting to reconnect...")
-                self.stats["detection_status"] = "Reconnecting..."
+                self._log_message("[Warning] Video capture disconnected, trying to reconnect after 5 seconds...")
                 time.sleep(5)
-                try:
-                    capture_source = int(self.video_source) if str(self.video_source).isdigit() else self.video_source
-                    self.cap = cv2.VideoCapture(capture_source)
-                except Exception as e:
-                    self.add_log_message(f"[ERROR] OpenCV Error during reconnect: {e}")
-                    self.cap = None
+                self.start_detection() # 尝试重新走一遍启动流程
+                break # 退出当前坏掉的循环，让新线程接管
 
-                if not self.cap or not self.cap.isOpened():
-                    self.add_log_message("[ERROR] Reconnect failed. Stopping detection.")
-                    self.running = False # This will break the loop
-                    self.stats["detection_status"] = "Stopped (Reconnect Failed)"
-                    break 
-                else:
-                    self.add_log_message("[INFO] Reconnected to video source.")
-                    self.stats["detection_status"] = "Running"
-
-            # --- 根据视频源类型，选择不同的帧读取和控制策略 ---
-            
             if self.is_video_file:
-                # --- 策略A：处理视频文件 ---
                 ret, frame = self.cap.read()
-                if not ret:
-                    self.add_log_message("[INFO] Video file ended. Looping.")
+                if not ret: # 如果是视频文件，播放到结尾后自动重播
+                    self._log_message("[INFORMATION] The video file ends playing and starts looping from the beginning.")
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
-            else:
-                # --- 策略B：处理实时流 (摄像头) ---
-                ret = self.cap.grab()
+            else: # 如果是实时流，进行跳帧处理
+                if time.time() - last_process_time < FRAME_INTERVAL:
+                    self.cap.grab() # 只抓取帧但不解码，快速跳过
+                    continue
+                ret, frame = self.cap.read()
+                last_process_time = time.time()
                 if not ret:
-                    self.add_log_message("[WARNING] Frame not received from stream. Pausing briefly.")
-                    time.sleep(0.5)
+                    self._log_message("[WARNING] Unable to get frame from live stream")
                     continue
 
-                current_time = time.time()
-                if current_time - last_process_time < FRAME_INTERVAL:
-                    continue # 时间没到，跳过
-                
-                last_process_time = current_time
-                ret, frame = self.cap.retrieve()
-                if not ret:
-                    continue
-            
-            # --- 从这里开始，是所有视频源共用的处理逻辑 ---
-            
-            # 1. 拷贝帧到录制缓冲区 (如果需要)
-            frame_copy_for_buffer = frame.copy()
-            self.recording_buffer.append((time.time(), frame_copy_for_buffer))
+            self.recording_buffer.append(frame.copy())
 
-            # 2. AI模型推理
             pose_results = self.pose_model(frame, verbose=False, conf=self.POSE_PERSON_CONF_THRESHOLD)
-            
-            # --- 新增步骤 A: 重置所有追踪器的更新状态 ---
-            for tracker in self.trackers.values():
-                tracker.updated_in_current_frame = False
-                # 假设我们已经通过IoU计算出了当前帧的检测结果
-                detected_this_frame = False 
-                head_region = tracker.get_head_region()
-                if head_region:
-                    for helmet_box in detected_helmets_boxes:
-                        if self.iou(head_region, helmet_box) > self.HELMET_IOU_THRESHOLD:
-                            detected_this_frame = True
-                            break
-                
-                # 调用新的平滑函数来更新状态，而不是直接赋值
-                tracker.update_helmet_status(detected_this_frame)
+            helmet_results = self.helmet_model(frame, verbose=False, classes=[self.helmet_class_id], conf=self.HELMET_CONF_THRESHOLD)
 
-
-            current_person_detections_for_tracking = []
+            current_detections = []
             for r in pose_results:
-                if r.keypoints is not None and r.boxes is not None:
-                    keypoints_data = r.keypoints.data.cpu().numpy() 
-                    boxes_data = r.boxes.data.cpu().numpy() 
-                    
-                    for i, (kpts, box_coords) in enumerate(zip(keypoints_data, boxes_data)):
-                        if box_coords[4] > self.POSE_PERSON_CONF_THRESHOLD: 
-                            current_person_detections_for_tracking.append({
-                                'keypoints': kpts,
-                                'box': box_coords[:4],
-                                'id': None
-                            })
-            self.update_trackers(current_person_detections_for_tracking)
+                if r.boxes is not None and r.keypoints is not None:
+                    for box, kpts in zip(r.boxes.data.cpu().numpy(), r.keypoints.data.cpu().numpy()):
+                        if box[4] > self.POSE_PERSON_CONF_THRESHOLD:
+                            current_detections.append({'keypoints': kpts, 'box': box[:4]})
 
-            # 2. Helmet Detection
-            detected_helmets_boxes = []
-            if self.helmet_class_id is not None:
-                helmet_results = self.helmet_model(frame, verbose=False, classes=[self.helmet_class_id], conf=self.OBJECT_HELMET_CONF_THRESHOLD)
-                for r_obj in helmet_results:
-                    for box in r_obj.boxes:
-                        if box.cls == self.helmet_class_id and box.conf > self.OBJECT_HELMET_CONF_THRESHOLD:
-                            detected_helmets_boxes.append(box.xyxy[0].cpu().numpy().astype(int))
-            
-            # # 3. Associate Helmets with Tracked Persons
-            # for tracker in self.trackers.values():
-            #     tracker.has_helmet = False # Reset for current frame, assume no helmet
-            #     if not tracker.keypoints_history or self.helmet_class_id is None: continue
+            self._update_trackers(current_detections)
 
-            #     head_region = tracker.get_head_region()
-            #     if head_region:
-            #         for helmet_box in detected_helmets_boxes:
-            #             if self.iou(head_region, helmet_box) > self.HELMET_IOU_THRESHOLD:
-            #                 tracker.has_helmet = True
-            #                 break 
-            
-            # # 4. Draw annotations and check alerts
-            # annotated_frame = self.draw_annotations_and_handle_alerts(frame.copy())
-
-            # with self.detection_lock:
-            #     self.latest_frame = annotated_frame.copy()
-
-            # 3. Associate Helmets with Tracked Persons and DEBUG DRAWING
-            # 先把所有检测到的安全帽画出来，不管它有没有匹配上人
-            # 用一种颜色，比如 蓝色
-            for helmet_box in detected_helmets_boxes:
-                x1, y1, x2, y2 = helmet_box
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2) # 蓝色 BGR
-                cv2.putText(frame, "Helmet?", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-
+            detected_helmet_boxes = [box.xyxy[0].cpu().numpy() for r in helmet_results for box in r.boxes]
 
             for tracker in self.trackers.values():
-
-                # --- 新增步骤 B: 只为当前帧更新过的追踪器执行后续操作 ---
-                if not tracker.updated_in_current_frame:
-                    continue # 如果这个追踪器是“过时的”，就直接跳过
-
-                tracker.has_helmet = False # Reset for current frame, assume no helmet
-                if not tracker.keypoints_history or self.helmet_class_id is None: continue
-
                 head_region = tracker.get_head_region()
+                helmet_found = False
                 if head_region:
-                    # 把估算的头部区域也画出来
-                    # 用另一种颜色，比如 黄色
-                    hx1, hy1, hx2, hy2 = head_region
-                    cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (0, 255, 255), 2) # 黄色 BGR
-                    cv2.putText(frame, f"P-{tracker.id} Head?", (hx1, hy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-                    
-                    for helmet_box in detected_helmets_boxes:
-                        iou_score = self.iou(head_region, helmet_box)
-                        # 在头顶上显示IoU分数，方便调试
-                        cv2.putText(frame, f"IoU:{iou_score:.2f}", (hx1, hy1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
-                        if iou_score > self.HELMET_IOU_THRESHOLD:
-                            tracker.has_helmet = True
+                    for helmet_box in detected_helmet_boxes:
+                        if self._iou(head_region, helmet_box) > self.HELMET_IOU_THRESHOLD:
+                            helmet_found = True
                             break
+                tracker.update_helmet_status(helmet_found)
 
-            # 4. Draw annotations and check alerts
-            # 注意，这里我们传入的是修改过的 frame，而不是 frame.copy()
-            annotated_frame = self.draw_annotations_and_handle_alerts(frame) 
+            annotated_frame = self._draw_annotations_and_handle_alerts(frame, detected_helmet_boxes)
 
             with self.detection_lock:
                 self.latest_frame = annotated_frame.copy()
 
-        # 在循环的最后，可以加一个 waitKey，特别是对于视频文件，可以给窗口一个响应机会
-        # 这个对于通过Flask等Web方式推流不是必须的，但对于本地显示窗口有好处
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'): # 允许按q退出
-                self.running = False
-
-        if self.cap and self.cap.isOpened():
+        if self.cap:
             self.cap.release()
-        self.add_log_message("[INFO] Detection loop finished.")
-        if self.stats["detection_status"] == "Running":
-            self.stats["detection_status"] = "Stopped (Loop Ended)"
+        self._log_message("[INFORMATION] The detection cycle has ended.")
 
-    def update_trackers(self, detections):
-        # Iterate over a list of items to allow deletion from self.trackers
-        current_tracker_ids = list(self.trackers.keys())
+    def _update_trackers(self, detections):
+        """匹配当前帧的检测结果与现有的追踪器，并处理新增和消失的目标。"""
         
+        # 标记所有追踪器为“本帧未更新”
+        for tracker in self.trackers.values():
+            tracker.updated_in_frame = False
+
         matched_detection_indices = set()
 
-        for tracker_id in current_tracker_ids:
-            if tracker_id not in self.trackers: continue # Tracker might have been removed in a previous iteration
-            tracker = self.trackers[tracker_id]
-            best_match_idx = -1
-            min_distance = self.TRACKER_MATCH_MAX_DISTANCE_PX
+        # 尝试为每个现有追踪器找到最佳匹配
+        for tracker_id, tracker in self.trackers.items():
+            best_match_idx, min_dist = -1, self.TRACKER_MAX_MATCH_DISTANCE_PX
             
             for i, det in enumerate(detections):
-                if i in matched_detection_indices: continue
+                if i in matched_detection_indices: continue # 跳过已匹配的检测
                 
-                distance = self.calculate_detection_distance(tracker, det)
-                if distance < min_distance:
-                    min_distance = distance
-                    best_match_idx = i
+                dist = self._calculate_distance(tracker.bbox, det['box'])
+                if dist < min_dist:
+                    min_dist, best_match_idx = dist, i
             
             if best_match_idx != -1:
+                # 找到匹配，更新追踪器
                 detection = detections[best_match_idx]
                 tracker.update(detection['keypoints'], detection['box'])
-                detection['id'] = tracker_id # Assign tracker ID to the matched detection
+                tracker.updated_in_frame = True
                 matched_detection_indices.add(best_match_idx)
-            else:
-                if time.time() - tracker.last_movement_time > self.TRACKER_DISAPPEAR_SECONDS_NO_MATCH :
-                     del self.trackers[tracker_id]
 
-        # Add new trackers for unmatched detections
+        # 移除长时间未更新的追踪器
+        disappeared_ids = []
+        for tracker_id, tracker in self.trackers.items():
+            if not tracker.updated_in_frame:
+                if time.time() - tracker.last_update_time > self.TRACKER_MAX_DISAPPEAR_SECONDS:
+                    disappeared_ids.append(tracker_id)
+                    self._log_message(f"[Tracking] ID-{tracker_id} was removed due to expiration timeout.")
+                    continue
+            if tracker.bbox is not None:
+                box_height = tracker.bbox[3] - tracker.bbox[1] # y2 - y1
+                if box_height < self.MIN_PERSON_HEIGHT_PIXELS:
+                    disappeared_ids.append(tracker_id)
+                    self._log_message(f"[Tracking] ID-{tracker_id} was removed due to being too small ({int(box_height)}px).")
+
+        for an_id in disappeared_ids:
+            if an_id in self.trackers: # 双重检查，防止因多条件判断导致重复删除
+                del self.trackers[an_id]
+
+        # 为未匹配的检测创建新追踪器
         for i, detection in enumerate(detections):
             if i not in matched_detection_indices:
-                new_tracker = PersonTracker(self.next_id, detection['keypoints'])
-                new_tracker.bbox = detection['box']
+                new_box = detection['box']
+                new_box_height = new_box[3] - new_box[1]
+                if new_box_height < self.MIN_PERSON_HEIGHT_PIXELS:
+                    # 如果一个新检测到的人一开始就太小，我们直接忽略他，不为他创建追踪器
+                    continue
+            
+                new_tracker = PersonTracker(self.next_id, detection['keypoints'], detection['box'])
                 self.trackers[self.next_id] = new_tracker
-                detection['id'] = self.next_id # Also mark this detection as assigned
-                self.next_id = (self.next_id + 1) % 100000 # Cycle IDs
+                self.next_id = (self.next_id + 1) % 100000 # ID循环使用
 
-    def calculate_detection_distance(self, tracker, detection):
-        if not tracker.keypoints_history: return float('inf')
+    def _draw_annotations_and_handle_alerts(self, frame, detected_helmet_boxes):
+        """在帧上绘制所有标注（边界框、状态文本等）并检查是否需要触发警报。"""
+        # 初始化当前帧的统计数据
+        stats_this_frame = {"fallen": 0, "stationary": 0, "no_helmet": 0}
         
-        last_kps_raw = tracker.keypoints_history[-1]
-        current_kps_raw = detection['keypoints']
-
-        try:
-            last_keypoints = np.array(last_kps_raw)
-            current_keypoints = np.array(current_kps_raw)
-
-            # Filter keypoints by confidence
-            last_valid_kps = last_keypoints[last_keypoints[:, 2] > 0.5][:, :2] # x, y
-            current_valid_kps = current_keypoints[current_keypoints[:, 2] > 0.5][:, :2] # x, y
-
-            if last_valid_kps.shape[0] == 0 or current_valid_kps.shape[0] == 0:
-                if tracker.bbox is not None and 'box' in detection and detection['box'] is not None:
-                    b1_cx = (tracker.bbox[0] + tracker.bbox[2]) / 2
-                    b1_cy = (tracker.bbox[1] + tracker.bbox[3]) / 2
-                    b2_cx = (detection['box'][0] + detection['box'][2]) / 2
-                    b2_cy = (detection['box'][1] + detection['box'][3]) / 2
-                    return np.linalg.norm(np.array([b1_cx, b1_cy]) - np.array([b2_cx, b2_cy]))
-                return float('inf')
-            
-            last_center = np.mean(last_valid_kps, axis=0)
-            current_center = np.mean(current_valid_kps, axis=0)
-            return np.linalg.norm(last_center - current_center)
-
-        except (IndexError, ValueError) as e: 
-            self.add_log_message(f"[DEBUG] Error in calculate_detection_distance: {e}")
-            return float('inf')
-        except Exception as e:
-            self.add_log_message(f"[ERROR] Unexpected error in calculate_detection_distance: {e}")
-            return float('inf')
-
-    def draw_annotations_and_handle_alerts(self, frame):
-        current_people = 0
-        current_fallen = 0
-        current_stationary = 0
-        current_no_helmet = 0
+        # --- (可选) 绘制所有检测到的安全帽框和头部估算区域，用于调试 ---
+        for helmet_box in detected_helmet_boxes:
+            x1, y1, x2, y2 = map(int, helmet_box)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 182, 0), 2) # 亮蓝色：检测到的安全帽
         
-        any_alert_condition_in_frame = False
-
+        # --- 遍历所有追踪器，绘制并检查警报 ---
         for tracker_id, tracker in self.trackers.items():
-            if not tracker.keypoints_history: continue
-            current_people +=1
+            color = (0, 255, 0) # 默认绿色
+            status_texts = [f"ID-{tracker_id}"]
             
-            box_to_draw = tracker.bbox 
-            if box_to_draw is None:
-                 valid_keypoints = np.array(tracker.keypoints_history[-1])
-                 valid_keypoints = valid_keypoints[valid_keypoints[:, 2] > 0.5]
-                 if len(valid_keypoints) > 0:
-                    x_coords, y_coords = valid_keypoints[:, 0], valid_keypoints[:, 1]
-                    box_to_draw = [x_coords.min(), y_coords.min(), x_coords.max(), y_coords.max()]
+            # --- 绘制头部估算区域 (调试用) ---
+            head_region = tracker.get_head_region()
+            if head_region:
+                hx1, hy1, hx2, hy2 = head_region
+                cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (0, 255, 255), 1, cv2.LINE_AA) # 黄色虚线：估算的头部区域
 
-            color = (0, 255, 0) # Green default
-            status_texts = [f"P{tracker_id}"]
-
+            # --- 检查并处理各种警报状态 ---
             if tracker.is_fallen:
-                color = (0, 0, 255)  # Red
+                color = (0, 0, 255) # 红色
                 status_texts.append("FALLEN")
-                current_fallen += 1
-                any_alert_condition_in_frame = True
-                if not tracker.fall_alert_sent and self.can_send_alert(tracker_id, "fall"):
-                    self.trigger_alert(f"FALLEN - Person {tracker_id}", tracker_id, "fall")
+                stats_this_frame["fallen"] += 1
+                if not tracker.fall_alert_sent and self._can_send_alert(tracker_id, "fall"):
+                    self._trigger_alert(f"Fall Alarm - ID {tracker_id}", tracker_id, "fall")
                     tracker.fall_alert_sent = True
             
             elif tracker.is_stationary:
-                color = (0, 165, 255)  # Orange
+                color = (0, 165, 255) # 橙色
                 status_texts.append("STATIONARY")
-                current_stationary += 1
-                any_alert_condition_in_frame = True
-                if not tracker.stationary_alert_sent and self.can_send_alert(tracker_id, "stationary"):
-                    self.trigger_alert(f"STATIONARY - Person {tracker_id}", tracker_id, "stationary")
+                stats_this_frame["stationary"] += 1
+                if not tracker.stationary_alert_sent and self._can_send_alert(tracker_id, "stationary"):
+                    self._trigger_alert(f"Long periods of inactivity - ID {tracker_id}", tracker_id, "stationary")
                     tracker.stationary_alert_sent = True
             
-            if self.helmet_class_id is not None:
-                if not tracker.has_helmet:
-                    if color == (0, 255, 0): color = (255, 0, 255) # Purple if no other alert color
-                    status_texts.append("NO HELMET")
-                    current_no_helmet +=1
-                    any_alert_condition_in_frame = True
-                    if not tracker.no_helmet_alert_sent and self.can_send_alert(tracker_id, "no_helmet"):
-                        self.trigger_alert(f"NO HELMET - Person {tracker_id}", tracker_id, "no_helmet")
-                        tracker.no_helmet_alert_sent = True
-                else:
-                    if tracker.no_helmet_alert_sent:
-                        tracker.no_helmet_alert_sent = False
-
-            if box_to_draw is not None:
-                x1, y1, x2, y2 = map(int, box_to_draw[:4])
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                
-                text_y_pos = y1 - 7
-                for i, text_line in enumerate(status_texts):
-                    cv2.putText(frame, text_line, (x1, text_y_pos - (i * 15)), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-        
-        with self.detection_lock:
-            self.stats["people_count"] = current_people
-            self.stats["fallen_count"] = current_fallen
-            self.stats["stationary_count"] = current_stationary
-            self.stats["no_helmet_count"] = current_no_helmet
-
-        self.an_alert_condition_exists = any_alert_condition_in_frame
-        if self.an_alert_condition_exists and not self.is_recording_alert_active:
-            self.is_recording_alert_active = True
-            first_alert_msg_for_filename = "alert_event"
-            if self.alerts:
-                for alert_text in list(self.alerts)[:5]:
-                    if " - Person " in alert_text:
-                        first_alert_msg_for_filename = alert_text.split("] ",1)[1]
-                        break
+            if not tracker.has_helmet:
+                color = (255, 0, 255) if color == (0, 255, 0) else color # 紫色 (如果没其他警报)
+                status_texts.append("NO HELMET")
+                stats_this_frame["no_helmet"] += 1
+                if not tracker.no_helmet_alert_sent and self._can_send_alert(tracker_id, "no_helmet"):
+                    self._trigger_alert(f"Not wearing a helmet - ID {tracker_id}", tracker_id, "no_helmet")
+                    tracker.no_helmet_alert_sent = True
             
-            threading.Thread(target=self.save_alert_recording, args=(first_alert_msg_for_filename,)).start()
+            # --- 绘制人体边界框和状态文本 ---
+            x1, y1, x2, y2 = map(int, tracker.bbox)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            for i, text in enumerate(status_texts):
+                y_pos = y1 - 10 - (i * 20)
+                cv2.putText(frame, text, (x1, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        if opcua_server:
-            try:
-                # 如果当前帧有人摔倒，FallStatus信号为1，否则为0
-                fall_signal = 1 if current_fallen > 0 else 0
-                if opcua_fall_variable is not None:
-                    # 检查当前值是否与要设置的值不同，避免不必要的写入
-                    if opcua_fall_variable.get_value() != fall_signal:
-                        print(f"[OPC UA] Setting FallSignal to {fall_signal}")
-                        opcua_fall_variable.set_value(fall_signal)
-                
-                # 如果当前帧有人未戴安全帽，NoHelmetStatus信号为1，否则为0
-                helmet_signal = 1 if current_no_helmet > 0 else 0
-                if opcua_helmet_variable is not None:
-                    # 检查当前值是否与要设置的值不同
-                    if opcua_helmet_variable.get_value() != helmet_signal:
-                        print(f"[OPC UA] Setting HelmetSignal to {fall_signal}")
-                        opcua_helmet_variable.set_value(helmet_signal)
-
-            except Exception as e:
-                print(f"❌ OPC UA: Failed to set values in main loop: {e}")
-
-        cv2.putText(frame, f"People: {current_people}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220,220,220), 2)
-        cv2.putText(frame, f"Fallen: {current_fallen}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255) if current_fallen else (220,220,220), 2)
-        cv2.putText(frame, f"Stationary: {current_stationary}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,165,255) if current_stationary else (220,220,220), 2)
-        cv2.putText(frame, f"No Helmet: {current_no_helmet}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,255) if current_no_helmet else (220,220,220), 2)
+        # --- 更新全局统计数据和OPC UA变量 ---
+        with self.detection_lock:
+            self.stats["people_count"] = len(self.trackers)
+            self.stats["fallen_count"] = stats_this_frame["fallen"]
+            self.stats["stationary_count"] = stats_this_frame["stationary"]
+            self.stats["no_helmet_count"] = stats_this_frame["no_helmet"]
+        self._update_opcua_variables(stats_this_frame["fallen"], stats_this_frame["no_helmet"])
         
+        # --- 绘制屏幕左上角的汇总信息 ---
+        cv2.putText(frame, f"People: {len(self.trackers)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220,220,220), 2)
+        cv2.putText(frame, f"Fallen: {stats_this_frame['fallen']}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255) if stats_this_frame['fallen'] else (220,220,220), 2)
+        cv2.putText(frame, f"Stationary: {stats_this_frame['stationary']}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,165,255) if stats_this_frame['stationary'] else (220,220,220), 2)
+        cv2.putText(frame, f"No Helmet: {stats_this_frame['no_helmet']}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,255) if stats_this_frame['no_helmet'] else (220,220,220), 2)
+
         return frame
 
-    def can_send_alert(self, person_id, alert_type):
-        now = time.time()
-        key = (person_id, alert_type)
-        last_alert_time_for_key = self.alert_cooldown_map.get(key, 0)
-        if now - last_alert_time_for_key > self.ALERT_COOLDOWN_SECONDS:
-            self.alert_cooldown_map[key] = now
-            return True
-        return False
+    def _update_opcua_variables(self, fallen_count, no_helmet_count):
+        """根据当前帧的警报数量，更新OPC UA服务器上的变量值。"""
+        if not opcua_server: return
+        try:
+            # 信号为1表示有警报，为0表示无警报
+            fall_signal = 1 if fallen_count > 0 else 0
+            helmet_signal = 1 if no_helmet_count > 0 else 0
 
-    def trigger_alert(self, message, person_id, alert_type):
+            if opcua_fall_variable and opcua_fall_variable.get_value() != fall_signal:
+                opcua_fall_variable.set_value(fall_signal)
+                # print(f"[OPC UA] 更新 FallStatus -> {fall_signal}")
 
+            if opcua_helmet_variable and opcua_helmet_variable.get_value() != helmet_signal:
+                opcua_helmet_variable.set_value(helmet_signal)
+                # print(f"[OPC UA] 更新 NoHelmetStatus -> {helmet_signal}")
+                
+        except Exception as e:
+            print(f"❌ Error updating OPC UA variables: {e}")
+
+    def _trigger_alert(self, message, person_id, alert_type):
+        """触发一个警报：记录日志、更新冷却时间、并启动视频录制。"""
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        log_message = f"[{timestamp}] ALERT: {message}"
+        log_message = f"[{timestamp}] [Warning] {message}"
+        self._log_message(log_message)
         
-        with self.detection_lock:
-            self.alerts.appendleft(log_message)
-        print(log_message)
+        # 更新冷却时间戳
+        self.alert_cooldown_map[(person_id, alert_type)] = time.time()
+        
+        # 启动一个新线程来保存警报录像，避免阻塞主检测循环
+        threading.Thread(target=self._save_alert_recording, args=(message,)).start()
 
-    def save_alert_recording(self, alert_message_for_filename="alert_event"):
-        self.add_log_message(f"[INFO] Alert recording triggered by: {alert_message_for_filename}")
-        
-        frames_to_save_data = list(self.recording_buffer)
-        
-        if not frames_to_save_data:
-            self.add_log_message("[WARNING] Recording buffer empty when save_alert_recording called.")
-            self.is_recording_alert_active = False
+    def _save_alert_recording(self, alert_message):
+        """将缓冲区中的帧保存为警报视频文件，并附带一个JSON信息文件。"""
+        frames_to_save = list(self.recording_buffer)
+        if not frames_to_save:
+            self._log_message("[Warning] Buffer was empty when recording was triggered.")
             return
 
-        timestamp_file = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_alert_parts = alert_message_for_filename.split(" - Person")[0].replace(" ", "_").replace("-","_")
-        safe_alert_msg = "".join(c for c in safe_alert_parts if c.isalnum() or c == '_')[:30]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 创建一个对文件名安全的消息字符串
+        safe_msg = "".join(c for c in alert_message if c.isalnum() or c in ' -').replace(' ', '_')
         
-        video_filename = f"alerts_data/recordings/REC_{safe_alert_msg}_{timestamp_file}.avi"
-        json_filename = f"alerts_data/json/INFO_{safe_alert_msg}_{timestamp_file}.json"
+        video_filename = f"alerts_data/recordings/REC_{safe_msg}_{timestamp}.avi"
+        json_filename = f"alerts_data/json/INFO_{safe_msg}_{timestamp}.json"
         
-        self.add_log_message(f"[INFO] Saving {len(frames_to_save_data)} frames to {video_filename}")
+        # 获取视频尺寸
+        height, width, _ = frames_to_save[0].shape
         
-        _ , first_frame_props = frames_to_save_data[0]
-        height, width = first_frame_props.shape[:2]
-        
-        out_fps = self.RECORDING_VIDEO_FPS
-        
+        # 创建视频写入器
         fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        video_writer = cv2.VideoWriter(video_filename, fourcc, out_fps, (width, height))
+        video_writer = cv2.VideoWriter(video_filename, fourcc, self.RECORDING_VIDEO_FPS, (width, height))
 
-        for _, frame_img in frames_to_save_data:
-            video_writer.write(frame_img)
-        
+        for frame in frames_to_save:
+            video_writer.write(frame)
         video_writer.release()
-        self.add_log_message(f"[INFO] Saved alert recording: {video_filename}")
+        self._log_message(f"[INFORMATION] Alarm video saved: {video_filename}")
 
+        # 创建并保存JSON元数据文件
         alert_info = {
-            'timestamp': timestamp_file,
-            'triggering_alert_message': alert_message_for_filename,
+            'timestamp': datetime.now().isoformat(),
+            'alert_message': alert_message,
             'video_file': os.path.basename(video_filename),
-            'video_path': video_filename,
-            'duration_seconds': len(frames_to_save_data) / out_fps if out_fps > 0 else 0,
-            'source_video': str(self.video_source),
-            'frames_saved': len(frames_to_save_data)
+            'source': str(self.video_source),
+            'frames_saved': len(frames_to_save)
         }
-        try:
-            with open(json_filename, 'w') as f:
-                json.dump(alert_info, f, indent=2)
-            self.add_log_message(f"[INFO] Saved alert metadata: {json_filename}")
-        except Exception as e:
-            self.add_log_message(f"[ERROR] Failed to save alert JSON: {e}")
-        
-        self.is_recording_alert_active = False
+        with open(json_filename, 'w', encoding='utf-8') as f:
+            json.dump(alert_info, f, indent=4, ensure_ascii=False)
 
-    def add_log_message(self, message):
+    # --- 辅助/工具函数 ---
+    def _log_message(self, message):
+        """向控制台和Web前端的日志队列中添加一条消息。"""
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        if not message.startswith("[") and "ALERT:" not in message: 
-            log_entry = f"[{timestamp}] [SYSTEM] {message}"
-        elif not message.startswith("["):
-            log_entry = f"[{timestamp}] {message}"
-        else:
-            log_entry = message
-        
+        log_entry = f"[{timestamp}] {message}" if not message.startswith("[") else message
         print(log_entry)
         with self.detection_lock:
             self.alerts.appendleft(log_entry)
 
-    def get_status(self):
-        with self.detection_lock:
-            stats_copy = self.stats.copy()
-            alerts_list = list(self.alerts)
-        return {
-            "running": self.running,
-            "source": str(self.video_source),
-            "is_file": self.is_video_file,
-            "stats": stats_copy,
-            "alerts": alerts_list
-        }
+    def _iou(self, boxA, boxB):
+        """计算两个边界框的交并比 (Intersection over Union)。"""
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[2], boxB[2])
+        yB = min(boxA[3], boxB[3])
+        interArea = max(0, xB - xA) * max(0, yB - yA)
+        boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+        boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+        denominator = float(boxAArea + boxBArea - interArea)
+        return interArea / denominator if denominator > 0 else 0.0
     
+    def _calculate_distance(self, boxA, boxB):
+        """计算两个边界框中心的欧氏距离。"""
+        center_A = ((boxA[0] + boxA[2]) / 2, (boxA[1] + boxA[3]) / 2)
+        center_B = ((boxB[0] + boxB[2]) / 2, (boxB[1] + boxB[3]) / 2)
+        return math.sqrt((center_A[0] - center_B[0])**2 + (center_A[1] - center_B[1])**2)
+
+    def _can_send_alert(self, person_id, alert_type):
+        """检查特定警报是否已过冷却期，可以再次发送。"""
+        now = time.time()
+        key = (person_id, alert_type)
+        last_alert_time = self.alert_cooldown_map.get(key, 0)
+        return now - last_alert_time > self.ALERT_COOLDOWN_SECONDS
+
+    # --- Web接口相关函数 ---
+    def get_status(self):
+        """获取系统当前状态，用于API返回。"""
+        with self.detection_lock:
+            # 返回数据的副本，避免多线程问题
+            return {
+                "running": self.running,
+                "source": str(self.video_source),
+                "stats": self.stats.copy(),
+                "alerts": list(self.alerts)
+            }
+            
     def update_video_source(self, new_source):
+        """更新视频源，只能在停止检测时调用。"""
         if self.running:
-            self.add_log_message("[WARNING] Cannot update source while detection is running. Please stop first.")
+            self._log_message("[WARNING] Cannot change video source while detection is running. Please stop first.")
             return False
-        
         self.video_source = new_source
-        self.is_video_file = self.check_if_video_file(self.video_source)
-        source_type = "Video File" if self.is_video_file else ("Webcam" if str(self.video_source).isdigit() else "Stream")
-        self.add_log_message(f"Video source updated to: {self.video_source} ({source_type})")
+        self.is_video_file = self._is_video_file_source()
+        self._log_message(f"[INFORMATION] Video source updated to: {self.video_source}")
         return True
 
-# --- Flask App Setup ---
 app = Flask(__name__)
+ADMIN_SECRET_KEY = "610" # 简单的管理员访问密钥
 
+# --- 初始化主系统 ---
 DEFAULT_VIDEO_SOURCE = "rtsp://admin:Admin4321@172.30.40.125/554/live/stream1"
+# DEFAULT_VIDEO_SOURCE = "test1.mp4"
 system = BehaviorDetectionSystem(video_source=DEFAULT_VIDEO_SOURCE)
 
 def generate_frames():
-    """Generator function for video streaming."""
+    """一个生成器函数，用于为Web前端提供MJPEG视频流。"""
     while True:
-        frame_to_send = None
         with system.detection_lock:
-            if system.latest_frame is not None:
-                frame_to_send = system.latest_frame.copy()
+            frame = system.latest_frame.copy() if system.latest_frame is not None else None
         
-        if frame_to_send is None:
-            black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            status_text = "System Initializing..."
-            if system.stats:
-                status_text = system.stats.get("detection_status", "Initializing...")
-                if not system.running and system.stats.get("model_status", "").startswith("Error"):
-                    status_text = f"Model Error: {system.stats['model_status'].split(': ',1)[-1]}"
-                elif not system.running and system.stats.get("detection_status", "").startswith("Stopped (Source Error)"):
-                     status_text = "Video Source Error"
+        if frame is None:
+            # 如果没有可用的帧（例如，系统刚启动或视频源错误），显示一个黑色背景和状态文本
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            status_text = system.stats.get("detection_status", "Initializing...")
+            cv2.putText(frame, status_text, (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            time.sleep(0.1) # 稍作等待，避免空循环占用过多CPU
 
-            cv2.putText(black_frame, status_text, (30, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            ret, buffer = cv2.imencode('.jpg', black_frame)
-        else:
-            ret, buffer = cv2.imencode('.jpg', frame_to_send)
-
+        # 将帧编码为JPEG格式
+        ret, buffer = cv2.imencode('.jpg', frame)
         if not ret:
-            time.sleep(0.05)
             continue
         
-        frame_bytes = buffer.tobytes()
+        # 以multipart/x-mixed-replace格式产出帧数据
         yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
         
-        time.sleep(0.01) 
-
-ADMIN_SECRET_KEY = "610"
+        time.sleep(0.02) # 控制推流帧率，减轻网络和浏览器负担
 
 @app.route('/')
 def index():
-    user_key = request.args.get('key')
-    is_admin = (user_key == ADMIN_SECRET_KEY)
-    return render_template('index.html', 
-                           current_source=str(system.video_source),
-                           is_admin=is_admin)
+    """渲染主页面。通过URL参数`key`判断是否为管理员。"""
+    is_admin = request.args.get('key') == ADMIN_SECRET_KEY
+    return render_template('index.html', current_source=str(system.video_source), is_admin=is_admin)
 
 @app.route('/video_feed')
 def video_feed():
-    return Response(generate_frames(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+    """视频流的API端点。"""
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/start', methods=['POST'])
 def start_detection_route():
-    if system.running:
-        return jsonify({"message": "Detection already running.", "status": "already_running"}), 400
-    
-    data = request.get_json()
-    new_source = data.get('source', system.video_source)
-    if str(new_source) != str(system.video_source):
-        if not system.update_video_source(new_source):
-            return jsonify({"message": "Failed to update source before starting.", "status": "error"}), 500
-
-    threading.Thread(target=system.start_detection, daemon=True).start()
-    time.sleep(0.5) 
-    if system.running:
-        return jsonify({"message": "Detection starting...", "status": "starting"})
-    else:
-        error_message = system.stats.get("detection_status", "Failed to start (Unknown error)")
-        if "Model Load Failed" in error_message or "Source Error" in error_message:
-            specific_error = system.stats.get("model_status", "") if "Model" in error_message else error_message
-            return jsonify({"message": f"Failed to start: {specific_error}", "status": "error"}), 500
-        return jsonify({"message": "Failed to start detection.", "status": "error"}), 500
-
+    """API端点：启动检测。"""
+    system.start_detection()
+    # 等待一小会儿，让系统状态更新
+    time.sleep(1)
+    return jsonify(system.get_status())
 
 @app.route('/stop', methods=['POST'])
 def stop_detection_route():
-    if not system.running:
-        return jsonify({"message": "Detection not running.", "status": "already_stopped"}), 400
-    
+    """API端点：停止检测。"""
     system.stop_detection()
-    return jsonify({"message": "Detection stopping...", "status": "stopping"})
+    return jsonify(system.get_status())
 
 @app.route('/status', methods=['GET'])
 def get_status_route():
+    """API端点：获取系统当前状态和日志。"""
     return jsonify(system.get_status())
 
 @app.route('/update_source', methods=['POST'])
 def update_source_route():
+    """API端点：更新视频源地址。"""
     if system.running:
-        return jsonify({"success": False, "message": "Stop detection before changing source."}), 400
+        return jsonify({"success": False, "message": "Please stop detection before changing the video source."}), 400
     
-    data = request.get_json()
-    new_source = data.get('source')
-    if new_source is None or str(new_source).strip() == "":
-        return jsonify({"success": False, "message": "No source provided."}), 400
+    new_source = request.json.get('source')
+    if not new_source:
+        return jsonify({"success": False, "message": "The video source address was not provided."}), 400
     
-    if system.update_video_source(str(new_source)):
-         return jsonify({"success": True, "message": f"Source updated to {new_source}."})
+    if system.update_video_source(new_source):
+        return jsonify({"success": True, "message": f"Video source updated to {new_source}。"})
     else:
-         return jsonify({"success": False, "message": "Failed to update source (unexpected)."}), 500
+        # 理论上不应该发生，除非有未知错误
+        return jsonify({"success": False, "message": "Failed to update video source."}), 500
 
 if __name__ == "__main__":
-    print("Starting application...")
+    print("--- Starting the safety behavior detection system ---")
 
-    # --- 启动OPC UA服务器线程 ---
-    # 创建一个线程来运行 start_opcua_server 函数
-    # daemon=True 意味着当主程序退出时，这个线程也会自动关闭
+    # 1. 在后台线程中启动OPC UA服务器
+    print("[Step 1/2] Starting OPC UA Server...")
     opcua_thread = threading.Thread(target=start_opcua_server, daemon=True)
     opcua_thread.start()
+    time.sleep(2) # 等待服务器初始化
 
-    # 等待一小会儿，确保服务器有足够的时间启动
-    time.sleep(2)
-
-    print(f"Flask app starting... Default video source: {DEFAULT_VIDEO_SOURCE}")
-    print("Open http://127.0.0.1:5000 (or your server's IP) in your browser.")
-    app.run(debug=True, host='172.30.32.231', port=5000, use_reloader=False, threaded=True)
+    # 2. 启动Flask Web服务器
+    print(f"[STEP 2/2] Starting Web Control Interface...")
+    print(f"  - Default video source:{DEFAULT_VIDEO_SOURCE}")
+    print(f"  - Ordinary user access: http://172.30.32.231:5000")
+    print(f"  - Administrator Access: http://172.30.32.231:5000/?key={ADMIN_SECRET_KEY}")
+    # use_reloader=False 对于多线程应用是必须的，以防止代码重载器与我们的线程冲突
+    app.run(host='172.30.32.231', port=5000, debug=False, use_reloader=False, threaded=True)
 
 # System Control web
 # Running on http://172.30.32.231:5000/?key=610
