@@ -72,10 +72,13 @@ class PersonTracker:
     STATIONARY_DURATION_SECONDS = 180 # 超过此时间（3分钟）没有有效移动，则判定为“静止”。
 
     FALL_ASPECT_RATIO_THRESHOLD = 1.8 # 边界框的 宽度/高度 > 1.8，则可能摔倒。
-    FALL_HIP_SHOULDER_TOLERANCE_PX = 10 # 允许臀部比肩膀低10个像素，仍视为直立。
+    FALL_HIP_SHOULDER_TOLERANCE_PX = 20 # 允许臀部比肩膀低10个像素，仍视为直立。
     
     STATE_CONFIRM_FRAMES = 3          # 状态需要连续N帧被确认才算生效（例如，连续3帧检测到安全帽才确认佩戴）。
     STATE_DISAPPEAR_FRAMES = 3        # 状态连续N帧未被确认，则认为消失（例如，连续5帧未检测到安全帽才确认未佩戴）。
+
+    MIN_STANDING_HEIGHT_PX = 130  # 最小站立高度
+    MIN_HIP_KNEE_DISTANCE_PX = 30  # 臀部膝盖最小距离
 
     def __init__(self, person_id, keypoints, bbox):
         """
@@ -161,36 +164,55 @@ class PersonTracker:
         return np.mean(distances)
 
     def _detect_fall(self) -> bool:
-        if not self.keypoints_history: return False
+        if not self.keypoints_history: 
+            return False
         
         kpts = np.array(self.keypoints_history[-1])
         
-        l_shoulder_idx, r_shoulder_idx, l_hip_idx, r_hip_idx = 5, 6, 11, 12
+        keypoints_indices = {
+            'left_shoulder': 5,
+            'right_shoulder': 6,
+            'left_hip': 11,
+            'right_hip': 12,
+            'head': 0,
+            'left_knee': 13,
+            'right_knee': 14
+        }
+
+        # l_shoulder_idx, r_shoulder_idx, l_hip_idx, r_hip_idx = 5, 6, 11, 12
+        # head_idx, l_knee_idx, r_knee_idx = 0, 13, 14
         
         def get_kpt(idx):
             return kpts[idx][:2] if len(kpts) > idx and kpts[idx][2] > 0.5 else None
 
-        left_shoulder, right_shoulder = get_kpt(l_shoulder_idx), get_kpt(r_shoulder_idx)
-        left_hip, right_hip = get_kpt(l_hip_idx), get_kpt(r_hip_idx)
+        # Extract keypoints
+        left_shoulder, right_shoulder = get_kpt(keypoints_indices['left_shoulder']), get_kpt(keypoints_indices['right_shoulder'])
+        left_hip, right_hip = get_kpt(keypoints_indices['left_hip']), get_kpt(keypoints_indices['right_hip'])
+        head = get_kpt(keypoints_indices['head'])
+        left_knee, right_knee = get_kpt(keypoints_indices['left_knee']), get_kpt(keypoints_indices['right_knee'])
 
-        if all(p is not None for p in [left_shoulder, right_shoulder, left_hip, right_hip]):
-            shoulder_center_y = (left_shoulder[1] + right_shoulder[1]) / 2
-            hip_center_y = (left_hip[1] + right_hip[1]) / 2
+        if not all(p is not None for p in [left_shoulder, right_shoulder, left_hip, right_hip]):
+            return False
 
-            body_width = abs(left_shoulder[0] - right_shoulder[0])
-            body_height = abs(shoulder_center_y - hip_center_y) + 1e-6
-            aspect_ratio = body_width / body_height
+        shoulder_center_y = (left_shoulder[1] + right_shoulder[1]) / 2
+        hip_center_y = (left_hip[1] + right_hip[1]) / 2
 
-            if aspect_ratio > self.FALL_ASPECT_RATIO_THRESHOLD:
-                    return True
+        body_width = abs(left_shoulder[0] - right_shoulder[0])
+        body_height = abs(shoulder_center_y - hip_center_y) + 1e-6
+        aspect_ratio = body_width / body_height
+
+        # if head is not None:
+        #     total_body_height = abs(head[1] - hip_center_y)
+        #     if total_body_height < self.MIN_STANDING_HEIGHT_PX:
+        #         return True
+
+        if left_knee is not None and right_knee is not None:
+            knee_center_y = (left_knee[1] + right_knee[1]) / 2
+            if abs(knee_center_y - hip_center_y) < self.MIN_HIP_KNEE_DISTANCE_PX:
+                return True
             
-            # if hip_center_y < shoulder_center_y + self.FALL_HIP_SHOULDER_TOLERANCE_PX:
-            #     body_width = abs(left_shoulder[0] - right_shoulder[0])
-            #     body_height = abs(shoulder_center_y - hip_center_y) + 1e-6
-                
-            #     aspect_ratio = body_width / body_height
-            #     if aspect_ratio > self.FALL_ASPECT_RATIO_THRESHOLD:
-            #         return True
+        if aspect_ratio > self.FALL_ASPECT_RATIO_THRESHOLD:
+                return True
                     
         return False
 
@@ -221,19 +243,6 @@ class PersonTracker:
                 hy2 = int(center_y + box_height * 0.35) # 35%在下方
                 return max(0, hx1), max(0, hy1), hx2, hy2
 
-            # center_x = min_x + face_width / 2
-            # center_y = min_y + face_height / 2
-
-            # box_width = face_width * 1.5
-            # box_height = face_width * 1.8 # 头盔是垂直较长的，这个比例是关键
-
-            # hx1 = int(center_x - box_width / 2)
-            # hy1 = int(center_y - box_height * 0.7)  # 从面部中心向上延伸更多
-            # hx2 = int(center_x + box_width / 2)
-            # hy2 = int(center_y + box_height * 0.3)  # 向下延伸较少
-
-            # return max(0, hx1), max(0, hy1), hx2, hy2
-
         if self.bbox is not None:
             x1, y1, x2, y2 = self.bbox
             person_height = y2 - y1
@@ -252,17 +261,6 @@ class PersonTracker:
             
             return head_x1, head_y1, head_x2, head_y2
         
-        # if self.bbox is not None:
-        #     x1, y1, x2, y2 = self.bbox
-        #     head_height = (y2 - y1) * 0.25 # 假设头部占身高的25%
-        #     head_width_margin = (x2 - x1) * 0.15 # 左右留出一些边距
-
-        #     head_x1 = int(x1 + head_width_margin)
-        #     head_y1 = int(y1)
-        #     head_x2 = int(x2 - head_width_margin)
-        #     head_y2 = int(y1 + head_height)
-        #     return head_x1, head_y1, head_x2, head_y2
-
         return None
 
 class BehaviorDetectionSystem:
