@@ -778,17 +778,93 @@ def update_source_route():
         # 理论上不应该发生，除非有未知错误
         return jsonify({"success": False, "message": "Failed to update video source."}), 500
 
+# ==============================================================================
+#  新增：文件定期清理模块
+# ==============================================================================
+import shutil
+
+def cleanup_old_files():
+    """
+    清理超过指定天数的旧警报文件（视频和JSON）。
+    此函数会被一个后台线程定期调用。
+    """
+    # 定义要清理的目录和文件的最大保留期限（14天）
+    FILE_MAX_AGE_DAYS = 14
+    FOLDERS_TO_CLEAN = [
+        "alerts_data/recordings",
+        "alerts_data/json"
+    ]
+    
+    now = time.time()
+    cutoff = now - (FILE_MAX_AGE_DAYS * 24 * 60 * 60) # 计算14天前的时间戳
+    
+    print(f"\n[Cleanup] Running scheduled cleanup task. Deleting files older than {FILE_MAX_AGE_DAYS} days...")
+    
+    deleted_files_count = 0
+    deleted_folders_count = 0
+
+    for folder_path in FOLDERS_TO_CLEAN:
+        if not os.path.exists(folder_path):
+            print(f"[Cleanup] Directory '{folder_path}' not found, skipping.")
+            continue
+            
+        try:
+            for filename in os.listdir(folder_path):
+                file_path = os.path.join(folder_path, filename)
+                
+                # 获取文件的最后修改时间
+                file_mod_time = os.path.getmtime(file_path)
+                
+                if file_mod_time < cutoff:
+                    try:
+                        os.remove(file_path)
+                        print(f"[Cleanup] Deleted old file: {file_path}")
+                        deleted_files_count += 1
+                    except OSError as e:
+                        print(f"[Cleanup] Error deleting file {file_path}: {e}")
+        except Exception as e:
+            print(f"[Cleanup] An error occurred while processing folder {folder_path}: {e}")
+
+    print(f"[Cleanup] Cleanup finished. Deleted {deleted_files_count} old files.")
+
+def scheduled_cleanup_thread():
+    """
+    一个后台线程，它会先立即运行一次清理任务，
+    然后每隔14天再次运行。
+    """
+    CLEANUP_INTERVAL_SECONDS = 14 * 24 * 60 * 60  # 14天转换为秒
+
+    while True:
+        try:
+            # 立即执行一次清理
+            cleanup_old_files()
+            
+            # 等待下一个周期
+            print(f"[Cleanup] Next cleanup is scheduled in {int(CLEANUP_INTERVAL_SECONDS / 3600 / 24)} days.")
+            time.sleep(CLEANUP_INTERVAL_SECONDS)
+        
+        except Exception as e:
+            print(f"[ERROR] The cleanup thread encountered an error: {e}")
+            # 发生错误时，等待1小时再重试，防止因永久性错误导致CPU空转
+            time.sleep(3600)
+# ==============================================================================
+
 if __name__ == "__main__":
     print("--- Starting the safety behavior detection system ---")
 
     # 1. 在后台线程中启动OPC UA服务器
-    print("[Step 1/2] Starting OPC UA Server...")
+    print("[Step 1/3] Starting OPC UA Server...")
     opcua_thread = threading.Thread(target=start_opcua_server, daemon=True)
     opcua_thread.start()
     time.sleep(2) # 等待服务器初始化
 
-    # 2. 启动Flask Web服务器
-    print(f"[STEP 2/2] Starting Web Control Interface...")
+    # 2. 在后台启动定期文件清理线程
+    print("[Step 2/3] Starting scheduled file cleanup service...")
+    cleanup_thread = threading.Thread(target=scheduled_cleanup_thread, daemon=True)
+    cleanup_thread.start()
+
+    # 3. 启动Flask Web服务器
+    print(f"[STEP 3/3] Starting Web Control Interface...")
     print(f"  - Default video source:{DEFAULT_VIDEO_SOURCE}")
     print(f"  - Ordinary user access: http://172.30.32.231:5000")
     print(f"  - Administrator Access: http://172.30.32.231:5000/?key={ADMIN_SECRET_KEY}")
